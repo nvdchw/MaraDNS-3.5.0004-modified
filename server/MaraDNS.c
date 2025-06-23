@@ -577,14 +577,14 @@ int mara_send(conn *ect, int sock, js_string *reply) {
                 return JS_ERROR;
         }
         if(ect->type == 4) {
-                sendto(sock,reply->string,reply->unit_count,0,
+                sendto(sock,(const char *)reply->string,reply->unit_count,0,
                                 (struct sockaddr *)ect->d,ect->addrlen);
                 return JS_SUCCESS;
 #ifdef IPV6
 /* Cygwin doesn't have ipv6 yet */
 #ifndef __CYGWIN__
         } else if(ect->type == 6) {
-                sendto(sock,reply->string,reply->unit_count,0,
+                sendto(sock,(const char *)reply->string,reply->unit_count,0,
                                 (struct sockaddr *)ect->d,ect->addrlen);
                 return JS_SUCCESS;
 #endif /* __CYGWIN__ */
@@ -689,7 +689,7 @@ int udperror(int sock,js_string *raw, struct sockaddr_in *from,
 
     /* Send them the reply */
     if(ect == 0) {
-        sendto(sock,reply->string,reply->unit_count,0,
+        sendto(sock,(const char *)reply->string,reply->unit_count,0,
             (struct sockaddr *)from,len_inet);
     } else {
         mara_send(ect,sock,reply);
@@ -1205,7 +1205,7 @@ long_packet_ok:
 
     /* Success! Put out the good data */
     if(ect == 0) {
-        sendto(sock,ar->string,ar->unit_count,0,
+        sendto(sock,(const char *)ar->string,ar->unit_count,0,
             (struct sockaddr *)client,len_inet);
     } else {
         mara_send(ect,sock,ar);
@@ -1677,7 +1677,7 @@ int udpstar(rr *where,int id,int sock,struct sockaddr_in *client,
 
     /* Success! Put out the good data */
     if(ect == 0) {
-        sendto(sock,ar->string,ar->unit_count,0,
+        sendto(sock,(const char *)ar->string,ar->unit_count,0,
             (struct sockaddr *)client,len_inet);
     } else {
         mara_send(ect,sock,ar);
@@ -1736,7 +1736,7 @@ int make_notthere_reply(int id, int sock, struct sockaddr_in *client,
 
         /* Send answer over UDP */
         if(ect == 0) {
-                sendto(sock,most->string,most->unit_count,0,
+                sendto(sock,(const char *)most->string,most->unit_count,0,
                         (struct sockaddr *)client,len_inet);
         } else {
                 mara_send(ect,sock,most);
@@ -1992,7 +1992,7 @@ int udpnotfound(rr *where, int id, int sock, struct sockaddr_in *client,
 
     /* Success! Put out the good data */
     if(ect == 0) {
-        sendto(sock,compressed->string,compressed->unit_count,0,
+        sendto(sock,(const char *)compressed->string,compressed->unit_count,0,
             (struct sockaddr *)client,len_inet);
     } else {
         mara_send(ect,sock,compressed);
@@ -3682,7 +3682,7 @@ int getudp(int *sock,ipv4pair *addr,conn *ect,
 #ifdef SELECT_PROBLEM
             fcntl(sock[counter], F_SETFL, O_NONBLOCK);
 #endif
-            len = recvfrom(sock[counter],data->string,max_len,0,
+            len = recvfrom(sock[counter],(char *)data->string,max_len,0,
                            (struct sockaddr *)ipv4_client,
                            (socklen_t *)&(ect->addrlen));
             if(len < 0) {
@@ -3714,7 +3714,7 @@ int getudp(int *sock,ipv4pair *addr,conn *ect,
             fcntl(sock[counter], F_SETFL, O_NONBLOCK);
 #endif
             stupid_gcc_warning = ect->addrlen;
-            len = recvfrom(sock[counter],data->string,max_len,0,
+            len = recvfrom(sock[counter],(char *)data->string,max_len,0,
                            (struct sockaddr *)ipv6_client,
                            &stupid_gcc_warning);
             ect->addrlen = stupid_gcc_warning;
