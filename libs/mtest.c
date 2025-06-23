@@ -6,9 +6,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-extern int mhash_firstkey();
-extern int mhash_nextkey();
-
 int main() {
     js_string *s1,*s2,*get;
     mhash *dict;

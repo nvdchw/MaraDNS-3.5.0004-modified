@@ -39,7 +39,7 @@ extern int max_total;
 extern rr *seenlist[256];
 extern int seenlist_where;
 extern ipv4pair long_packet[512];
-extern int calc_ra_value(); /* Make -Wall happy */
+extern int calc_ra_value(int); /* Make -Wall happy */
 
 /* If we successfully found a record, spit out that record on the
    udp packet.
@@ -597,7 +597,7 @@ long_packet_ok:
 
     /* Success! Put out the good data */
     if(ect == 0) {
-        sendto(sock,ar->string,ar->unit_count,0,
+        sendto(sock,(const char*)ar->string,ar->unit_count,0,
             (struct sockaddr *)client,len_inet);
     } else {
         mara_send(ect,sock,ar);
