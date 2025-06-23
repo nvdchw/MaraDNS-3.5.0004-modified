@@ -175,6 +175,9 @@ ipv4pair long_packet[512];
  * etc.). */
 ipv4pair admin_acl[512];
 
+unsigned int synthetic_ip_counter = 1; // Start at 1, wrap at 254
+mhash *synthetic_ip_map = 0; // hostname -> assigned synthetic IP
+
 /* Some global variables so that the user can change the SOA origin (MINFO)
  * and the format of the SOA serial number if needed */
 js_string *synth_soa_origin = 0;
@@ -467,6 +470,102 @@ int get_header_rd(js_string *query) {
                 return 0;
         }
         return *(query->string + 2) & 0x01;
+}
+
+/* This function sends a synthetic A reply to a DNS query.
+ * It assigns a synthetic IP address to the hostname in the query,
+ * and sends back an A record with that IP.
+ * Input: id (DNS transaction ID), sock (socket number), ect (connection
+ *        structure), query (the DNS query string)
+ * Output: JS_SUCCESS on success, JS_ERROR on error
+ */
+int send_synthetic_a_reply(int id, int sock, conn *ect, js_string *query) {
+    js_string *reply;
+    q_header header;
+    int i;
+    unsigned char ip[4];
+    mhash_e spot_data;
+    js_string *key = js_create(256,1);
+
+    // Always assign IP as 10.0.0.X (X increments)
+    ip[0] = 10;
+    ip[1] = 0;
+    ip[2] = 0;
+    ip[3] = 0;
+
+    // Use the query as the key (lowercase for consistency)
+    js_copy(query, key);
+    fold_case(key);
+
+    // Check if this hostname already has a synthetic IP
+    spot_data = mhash_get(synthetic_ip_map, key);
+    if(spot_data.value != 0 && spot_data.datatype == 1) {
+        // Use the stored IP
+        memcpy(ip, spot_data.value, 4);
+    } else {
+        // Assign a new IP
+        ip[3] = synthetic_ip_counter++;
+        if (synthetic_ip_counter > 254) synthetic_ip_counter = 1;
+        // Store the IP in the map
+        unsigned char *stored_ip = malloc(4);
+        memcpy(stored_ip, ip, 4);
+        mhash_put(synthetic_ip_map, key, stored_ip, 1);
+    }
+
+    printf("[DEBUG] send_synthetic_a_reply: Responding with IP: %d.%d.%d.%d\n",
+        ip[0], ip[1], ip[2], ip[3]);
+    fflush(stdout);
+
+    if ((reply = js_create(512,1)) == 0) {
+        printf("[DEBUG] send_synthetic_a_reply: Failed to create reply js_string\n");
+        js_destroy(key);
+        return JS_ERROR;
+    }
+
+    // Build DNS header
+    header.id = id;
+    header.qr = 1;
+    header.opcode = 0;
+    header.aa = 1;
+    header.tc = 0;
+    header.rd = 0;
+    header.ra = 0;
+    header.z = 0;
+    header.rcode = 0;
+    header.qdcount = 1;
+    header.ancount = 1;
+    header.nscount = 0;
+    header.arcount = 0;
+
+    // Set the header in the reply
+    if (make_hdr(&header, reply) == JS_ERROR) goto cleanup;
+
+    // Append the question section: QNAME + QTYPE + QCLASS
+    if (js_append(query, reply) == JS_ERROR) goto cleanup;
+    if (js_adduint16(reply, 1) == JS_ERROR) goto cleanup; // Class IN
+
+    // Answer section
+    // Name: pointer to offset 12 (start of QNAME in DNS packet)
+    if (js_adduint16(reply, 0xc00c) == JS_ERROR) goto cleanup;
+    if (js_adduint16(reply, 1) == JS_ERROR) goto cleanup; // Type A
+    if (js_adduint16(reply, 1) == JS_ERROR) goto cleanup; // Class IN
+    if (js_adduint32(reply, 60) == JS_ERROR) goto cleanup; // TTL 60s
+    if (js_adduint16(reply, 4) == JS_ERROR) goto cleanup; // RDLENGTH
+    for (i = 0; i < 4; i++)
+        if (js_addbyte(reply, ip[i]) == JS_ERROR) goto cleanup;
+    
+    printf("[DEBUG] send_synthetic_a_reply: Sending reply...\n");
+    // Send the reply
+    mara_send(ect, sock, reply);
+    js_destroy(reply);
+    js_destroy(key);
+    return JS_SUCCESS;
+
+cleanup:
+    printf("[DEBUG] send_synthetic_a_reply: cleanup called due to error\n");
+    js_destroy(reply);
+    js_destroy(key);
+    return JS_ERROR;
 }
 
 /* This function takes a conn *ect (a MaraDNS-specific description of a
@@ -2584,6 +2683,22 @@ int proc_query(js_string *raw, conn *ect, int sock) {
     if(qtype == JS_ERROR) {
         goto serv_fail;
         }
+    
+    // Debug: Print the query type
+    printf("[DEBUG] proc_query: Query type is %d\n", qtype);
+    fflush(stdout);
+
+    // Intercept A queries and reply with synthetic IP
+    if(qtype == RR_A) {
+        mhash_e spot_data = mhash_get(bighash, lookfor);
+        if(spot_data.value == 0) {
+            printf("[DEBUG] proc_query: Intercepted A query, sending synthetic reply\n");
+            fflush(stdout);
+            send_synthetic_a_reply(header.id, sock, ect, origq);
+            js_destroy(lookfor); js_destroy(origq); js_destroy(lc);
+            return JS_SUCCESS;
+        }
+    }
 
     /* We may reject AAAA queries */
     if(qtype == 28 && reject_aaaa != 0) {
@@ -4432,6 +4547,11 @@ int main(int argc, char **argv) {
     bighash = mhash_create(8);
     if(bighash == 0)
         harderror(L_NOBIGHASH); /* "Could not create big hash" */
+    
+    /* Create the syntehtic IP map hash */
+    synthetic_ip_map = mhash_create(8);
+    if(synthetic_ip_map == 0)
+        harderror("Could not create synthetic_ip_map");
 
     /* populate_main uses qual timestamps for the csv2 zone files */
     qual_set_time();
