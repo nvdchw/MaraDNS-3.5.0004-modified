@@ -63,6 +63,11 @@
 #include "timestamp.h"
 #include "read_kvars.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#define PIPE_NAME "\\\\.\\pipe\\maradns_synth"
+
+
 /* Virutal memory limit */
 #ifdef RLIMIT_AS
 #define MAX_MEM RLIMIT_AS
@@ -183,6 +188,7 @@ mhash *synthetic_ip_map = 0; // hostname -> assigned synthetic IP
 #define MAX_USED_IPS 4096
 unsigned char used_zone_a_ips[MAX_USED_IPS][4];
 int used_zone_a_ip_count = 0;
+
 
 /* Some global variables so that the user can change the SOA origin (MINFO)
  * and the format of the SOA serial number if needed */
@@ -478,6 +484,50 @@ int get_header_rd(js_string *query) {
         return *(query->string + 2) & 0x01;
 }
 
+// Converts a DNS wire-format name in js_string to a C string (hostname)
+// Assumes js->string points to the start of the QNAME (not the DNS header)
+int js_ntoa(js_string *js, char *out, size_t outlen) {
+    if (!js || !out || js->unit_count < 2) return -1;
+    size_t pos = 0, outpos = 0;
+    while (pos < js->unit_count) {
+        unsigned char len = js->string[pos];
+        if (len == 0) {
+            // End of name
+            if (outpos < outlen) out[outpos] = '\0';
+            else if (outlen > 0) out[outlen-1] = '\0';
+            return 0;
+        }
+        if (len > 63 || pos + len + 1 > js->unit_count) break;
+        if (outpos && outpos < outlen-1) out[outpos++] = '.';
+        for (int i = 0; i < len && outpos < outlen-1; i++)
+            out[outpos++] = js->string[pos + 1 + i];
+        pos += len + 1;
+    }
+    if (outlen > 0) out[outlen-1] = '\0';
+    return -1;
+}
+
+/* This function writes a hostname/IP pair to a named pipe for
+ * synthetic IPs.  This is used to communicate with the MaraDNS
+ * synthetic IP server on Windows.
+ * Input: hostname (the hostname), ip (the 4-byte IP address)
+ * Output: None
+ */
+// Writes a hostname/IP pair to the named pipe
+void write_to_named_pipe(const char *hostname, unsigned char ip[4]) {
+    HANDLE hPipe = CreateFileA(
+        PIPE_NAME, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    if (hPipe == INVALID_HANDLE_VALUE) return;
+
+    char buffer[512];
+    int len = snprintf(buffer, sizeof(buffer), "%s,%d.%d.%d.%d\n",
+        hostname, ip[0], ip[1], ip[2], ip[3]);
+    DWORD written = 0;
+    WriteFile(hPipe, buffer, len, &written, NULL);
+    CloseHandle(hPipe);
+}
+#endif
+
 /* This function checks if a given IP address is already in use in any
  * A record in the bighash.  It returns 1 if the IP is in use, and 0
  * otherwise.
@@ -529,6 +579,12 @@ int send_synthetic_a_reply(int id, int sock, conn *ect, js_string *query) {
         unsigned char *stored_ip = malloc(4);
         memcpy(stored_ip, ip, 4);
         mhash_put(synthetic_ip_map, key, stored_ip, 1);
+#ifdef _WIN32
+        // Output to named pipe
+        char hostname[256];
+        js_ntoa(query, hostname, sizeof(hostname)); // You may need to implement js_ntoa
+        write_to_named_pipe(hostname, ip);
+#endif
     }
 
     printf("[DEBUG] send_synthetic_a_reply: Responding with IP: %d.%d.%d.%d\n",
