@@ -178,6 +178,12 @@ ipv4pair admin_acl[512];
 unsigned int synthetic_ip_counter = 1; // Start at 1, wrap at 254
 mhash *synthetic_ip_map = 0; // hostname -> assigned synthetic IP
 
+/* A list of IPs used in the zone file; this is used to prevent MaraDNS
+ * from assigning the same synthetic IP to two different hostnames */
+#define MAX_USED_IPS 4096
+unsigned char used_zone_a_ips[MAX_USED_IPS][4];
+int used_zone_a_ip_count = 0;
+
 /* Some global variables so that the user can change the SOA origin (MINFO)
  * and the format of the SOA serial number if needed */
 js_string *synth_soa_origin = 0;
@@ -472,6 +478,22 @@ int get_header_rd(js_string *query) {
         return *(query->string + 2) & 0x01;
 }
 
+/* This function checks if a given IP address is already in use in any
+ * A record in the bighash.  It returns 1 if the IP is in use, and 0
+ * otherwise.
+ * Input: An unsigned char array of length 4 containing the IP address
+ * Output: 1 if the IP is in use, 0 otherwise
+ */
+// Returns 1 if ip[4] is already used in any A record, 0 otherwise
+int is_ip_in_zone(unsigned char ip[4]) {
+        for (int i = 0; i < used_zone_a_ip_count; i++) {
+        if (memcmp(used_zone_a_ips[i], ip, 4) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* This function sends a synthetic A reply to a DNS query.
  * It assigns a synthetic IP address to the hostname in the query,
  * and sends back an A record with that IP.
@@ -483,15 +505,10 @@ int send_synthetic_a_reply(int id, int sock, conn *ect, js_string *query) {
     js_string *reply;
     q_header header;
     int i;
-    unsigned char ip[4];
     mhash_e spot_data;
     js_string *key = js_create(256,1);
-
-    // Always assign IP as 10.0.0.X (X increments)
-    ip[0] = 10;
-    ip[1] = 0;
-    ip[2] = 0;
-    ip[3] = 0;
+    // Assign private IP address starting with 192.168.21.0
+    unsigned char ip[4] = {192, 168, 21, 0};
 
     // Use the query as the key (lowercase for consistency)
     js_copy(query, key);
@@ -503,9 +520,11 @@ int send_synthetic_a_reply(int id, int sock, conn *ect, js_string *query) {
         // Use the stored IP
         memcpy(ip, spot_data.value, 4);
     } else {
-        // Assign a new IP
-        ip[3] = synthetic_ip_counter++;
-        if (synthetic_ip_counter > 254) synthetic_ip_counter = 1;
+        // Assign a new IP, skipping any that are already in the zone
+        do {
+            ip[3] = synthetic_ip_counter++;
+            if (synthetic_ip_counter > 254) synthetic_ip_counter = 1;
+        } while (is_ip_in_zone(ip));
         // Store the IP in the map
         unsigned char *stored_ip = malloc(4);
         memcpy(stored_ip, ip, 4);
@@ -553,9 +572,8 @@ int send_synthetic_a_reply(int id, int sock, conn *ect, js_string *query) {
     if (js_adduint16(reply, 4) == JS_ERROR) goto cleanup; // RDLENGTH
     for (i = 0; i < 4; i++)
         if (js_addbyte(reply, ip[i]) == JS_ERROR) goto cleanup;
-    
+
     printf("[DEBUG] send_synthetic_a_reply: Sending reply...\n");
-    // Send the reply
     mara_send(ect, sock, reply);
     js_destroy(reply);
     js_destroy(key);
@@ -3821,7 +3839,7 @@ int main(int argc, char **argv) {
     int errorn, value, maxprocs, counter;
     int sock[514];
     int cache_size;
-    int min_ttl_n = 300, min_ttl_c = 300;
+    // int min_ttl_n = 300, min_ttl_c = 300;
     int timestamp_type = 5; /* Type of timestamp */
 #ifndef AUTHONLY
     int max_glueless; /* Maximum allowed glueless level */
@@ -3835,14 +3853,14 @@ int main(int argc, char **argv) {
     int thread_overhead = THREAD_OVERHEAD; /* The amount of memory we need
                                             * to allow to be allocated for
                                             * threads */
-#else
-    int thread_overhead = 0; /* No memory needed for threads */
+// #else
+//     int thread_overhead = 0; /* No memory needed for threads */
 /* Cygwin doesn't have ipv6 support yet */
-#ifndef __CYGWIN__
-    struct sockaddr_in6 *clin6;
-#endif /* __CYGWIN__ */
+// #ifndef __CYGWIN__
+//     struct sockaddr_in6 *clin6;
+// #endif /* __CYGWIN__ */
 #endif
-    int verbose_query = 0;
+    // int verbose_query = 0;
     struct sockaddr client;
     struct sockaddr_in *clin = 0; /* So we can log the IP */
 #ifndef MINGW32
@@ -3886,9 +3904,9 @@ int main(int argc, char **argv) {
     clin = (struct sockaddr_in *)&client;
 #ifdef AUTHONLY
 /* Cygwin doesn't have ipv6 yet */
-#ifndef __CYGWIN__
-    clin6 = (struct sockaddr_in6 *)&client;
-#endif /* __CYGWIN__ */
+// #ifndef __CYGWIN__
+//     clin6 = (struct sockaddr_in6 *)&client;
+// #endif /* __CYGWIN__ */
 #endif
 
     /* Initialize the strings (allocate memory for them, etc.) */
@@ -4048,8 +4066,8 @@ int main(int argc, char **argv) {
     set_timestamp(timestamp_type);
 
     /* Get the minttl values from the kvar database (if there) */
-    min_ttl_n = read_numeric_kvar("min_ttl",300);
-    min_ttl_c = read_numeric_kvar("min_ttl_cname",min_ttl_n);
+    // min_ttl_n = read_numeric_kvar("min_ttl",300);
+    // min_ttl_c = read_numeric_kvar("min_ttl_cname",min_ttl_n);
     min_visible_ttl = read_numeric_kvar("min_visible_ttl",30);
     if(min_visible_ttl < 5)
         min_visible_ttl = 5;
@@ -4118,7 +4136,7 @@ int main(int argc, char **argv) {
     /* Whether to supress dangling CNAME warnings */
     no_cname_warnings = read_numeric_kvar("no_cname_warnings",0);
 
-    verbose_query = read_numeric_kvar("verbose_query",0);
+    // verbose_query = read_numeric_kvar("verbose_query",0);
 
     /* Set the dns_port */
     dns_port = read_numeric_kvar("dns_port",53);
@@ -4559,7 +4577,38 @@ int main(int argc, char **argv) {
     if(dns_records_served > 0) {
         printf("MaraDNS proudly serves you %d DNS records\n",
                dns_records_served);
+         // Scan bighash for A records and collect their IPs
+        used_zone_a_ip_count = 0;
+        js_string *key = js_create(256, 1); // Temporary key for iteration
+        if (key == NULL) {
+            fprintf(stderr, "Failed to create js_string for key iteration\n");
+            exit(1);
         }
+
+        if (mhash_firstkey(bighash, key) == JS_SUCCESS) {
+            do {
+                mhash_e spot_data = mhash_get(bighash, key);
+                if (spot_data.value != 0 && spot_data.datatype == MARA_DNS_LIST) {
+                    rr_list *answer = (rr_list *)spot_data.value;
+                    while (answer) {
+                        rr *rec = answer->data;
+                        while (rec) {
+                            if (rec->rr_type == RR_A && rec->data && rec->data->unit_count == 4) {
+                                if (used_zone_a_ip_count < MAX_USED_IPS) {
+                                    memcpy(used_zone_a_ips[used_zone_a_ip_count], rec->data->string, 4);
+                                    used_zone_a_ip_count++;
+                                }
+                            }
+                            rec = rec->next;
+                        }
+                        answer = answer->next;
+                    }
+                }
+            } while (mhash_nextkey(bighash, key) == JS_SUCCESS);
+        }
+
+        js_destroy(key); // Clean up the temporary key
+    }
 
     /* Limit the amount of memory we can use */
 #ifdef MAX_MEM
