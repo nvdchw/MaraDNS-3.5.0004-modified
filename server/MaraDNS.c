@@ -180,8 +180,9 @@ ipv4pair long_packet[512];
  * etc.). */
 ipv4pair admin_acl[512];
 
+// A list of IPv4 addresses that are allowed
 unsigned int synthetic_ip_counter = 1; // Start at 1, wrap at 254
-mhash *synthetic_ip_map = 0; // hostname -> assigned synthetic IP
+mhash *synthetic_ip_hash = 0; // hostname -> assigned synthetic IP
 
 /* A list of IPs used in the zone file; this is used to prevent MaraDNS
  * from assigning the same synthetic IP to two different hostnames */
@@ -489,20 +490,24 @@ int get_header_rd(js_string *query) {
 int js_ntoa(js_string *js, char *out, size_t outlen) {
     if (!js || !out || js->unit_count < 2) return -1;
     size_t pos = 0, outpos = 0;
+
     while (pos < js->unit_count) {
         unsigned char len = js->string[pos];
+        // If the length byte is 0, this indicates the end of the name
         if (len == 0) {
-            // End of name
             if (outpos < outlen) out[outpos] = '\0';
             else if (outlen > 0) out[outlen-1] = '\0';
             return 0;
         }
+        // If the length byte is invalid, break and return an error
         if (len > 63 || pos + len + 1 > js->unit_count) break;
         if (outpos && outpos < outlen-1) out[outpos++] = '.';
+        // Copy the label to the output string
         for (int i = 0; i < len && outpos < outlen-1; i++)
             out[outpos++] = js->string[pos + 1 + i];
         pos += len + 1;
     }
+    // If we reached here, it means the name was malformed or too long
     if (outlen > 0) out[outlen-1] = '\0';
     return -1;
 }
@@ -515,12 +520,14 @@ int js_ntoa(js_string *js, char *out, size_t outlen) {
  */
 // Writes a hostname/IP pair to the named pipe
 void write_to_named_pipe(const char *hostname, unsigned char ip[4]) {
+    // Open the named pipe for writing
     HANDLE hPipe = CreateFileA(
         PIPE_NAME, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
     if (hPipe == INVALID_HANDLE_VALUE) return;
 
+    // Write the hostname and IP to the pipe
     char buffer[512];
-    int len = snprintf(buffer, sizeof(buffer), "%s,%d.%d.%d.%d\n",
+    int len = snprintf(buffer, sizeof(buffer), "%s, %d.%d.%d.%d\n",
         hostname, ip[0], ip[1], ip[2], ip[3]);
     DWORD written = 0;
     WriteFile(hPipe, buffer, len, &written, NULL);
@@ -536,6 +543,7 @@ void write_to_named_pipe(const char *hostname, unsigned char ip[4]) {
  */
 // Returns 1 if ip[4] is already used in any A record, 0 otherwise
 int is_ip_in_zone(unsigned char ip[4]) {
+        // Check the used_zone_a_ips array
         for (int i = 0; i < used_zone_a_ip_count; i++) {
         if (memcmp(used_zone_a_ips[i], ip, 4) == 0) {
             return 1;
@@ -557,7 +565,7 @@ int send_synthetic_a_reply(int id, int sock, conn *ect, js_string *query) {
     int i;
     mhash_e spot_data;
     js_string *key = js_create(256,1);
-    // Assign private IP address starting with 192.168.21.0
+    // Assign private IP address in 192.168.21.0/24 subnet
     unsigned char ip[4] = {192, 168, 21, 0};
 
     // Use the query as the key (lowercase for consistency)
@@ -565,7 +573,7 @@ int send_synthetic_a_reply(int id, int sock, conn *ect, js_string *query) {
     fold_case(key);
 
     // Check if this hostname already has a synthetic IP
-    spot_data = mhash_get(synthetic_ip_map, key);
+    spot_data = mhash_get(synthetic_ip_hash, key);
     if(spot_data.value != 0 && spot_data.datatype == 1) {
         // Use the stored IP
         memcpy(ip, spot_data.value, 4);
@@ -573,16 +581,18 @@ int send_synthetic_a_reply(int id, int sock, conn *ect, js_string *query) {
         // Assign a new IP, skipping any that are already in the zone
         do {
             ip[3] = synthetic_ip_counter++;
+            // Wrap around if we exceed 254
             if (synthetic_ip_counter > 254) synthetic_ip_counter = 1;
         } while (is_ip_in_zone(ip));
-        // Store the IP in the map
+        // Store the IP in the synthetic IP hash table
         unsigned char *stored_ip = malloc(4);
         memcpy(stored_ip, ip, 4);
-        mhash_put(synthetic_ip_map, key, stored_ip, 1);
+        mhash_put(synthetic_ip_hash, key, stored_ip, 1);
 #ifdef _WIN32
         // Output to named pipe
         char hostname[256];
-        js_ntoa(query, hostname, sizeof(hostname)); // You may need to implement js_ntoa
+        // Convert js_string to C string
+        js_ntoa(query, hostname, sizeof(hostname));
         write_to_named_pipe(hostname, ip);
 #endif
     }
@@ -2757,18 +2767,17 @@ int proc_query(js_string *raw, conn *ect, int sock) {
     if(qtype == JS_ERROR) {
         goto serv_fail;
         }
-    
-    // Debug: Print the query type
-    printf("[DEBUG] proc_query: Query type is %d\n", qtype);
-    fflush(stdout);
 
     // Intercept A queries and reply with synthetic IP
     if(qtype == RR_A) {
         mhash_e spot_data = mhash_get(bighash, lookfor);
+        // If we have a record with this name, we will not send a synthetic reply
         if(spot_data.value == 0) {
             printf("[DEBUG] proc_query: Intercepted A query, sending synthetic reply\n");
             fflush(stdout);
+            // Create a synthetic reply
             send_synthetic_a_reply(header.id, sock, ect, origq);
+            // Clean up and return success
             js_destroy(lookfor); js_destroy(origq); js_destroy(lc);
             return JS_SUCCESS;
         }
@@ -4621,11 +4630,11 @@ int main(int argc, char **argv) {
     bighash = mhash_create(8);
     if(bighash == 0)
         harderror(L_NOBIGHASH); /* "Could not create big hash" */
-    
-    /* Create the syntehtic IP map hash */
-    synthetic_ip_map = mhash_create(8);
-    if(synthetic_ip_map == 0)
-        harderror("Could not create synthetic_ip_map");
+
+    /* Create the synthetic IP hash table */
+    synthetic_ip_hash = mhash_create(8);
+    if(synthetic_ip_hash == 0)
+        harderror("Could not create synthetic_ip_hash");
 
     /* populate_main uses qual timestamps for the csv2 zone files */
     qual_set_time();
@@ -4633,24 +4642,31 @@ int main(int argc, char **argv) {
     if(dns_records_served > 0) {
         printf("MaraDNS proudly serves you %d DNS records\n",
                dns_records_served);
-         // Scan bighash for A records and collect their IPs
+        // Scan bighash for A records and collect their IPs
         used_zone_a_ip_count = 0;
-        js_string *key = js_create(256, 1); // Temporary key for iteration
+        // Create a temporary key for iteration
+        js_string *key = js_create(256, 1);
         if (key == NULL) {
             fprintf(stderr, "Failed to create js_string for key iteration\n");
             exit(1);
         }
 
         if (mhash_firstkey(bighash, key) == JS_SUCCESS) {
+            // Iterate through the bighash to find A records
             do {
+                // Get the data associated with the key
                 mhash_e spot_data = mhash_get(bighash, key);
                 if (spot_data.value != 0 && spot_data.datatype == MARA_DNS_LIST) {
                     rr_list *answer = (rr_list *)spot_data.value;
+                    // If the data is a list, iterate through it
                     while (answer) {
                         rr *rec = answer->data;
+                        // Iterate through the records in the answer
                         while (rec) {
+                            // If the record is an A record and has valid data
                             if (rec->rr_type == RR_A && rec->data && rec->data->unit_count == 4) {
                                 if (used_zone_a_ip_count < MAX_USED_IPS) {
+                                    // Store the first 4 bytes of the A record's data into used_zone_a_ips
                                     memcpy(used_zone_a_ips[used_zone_a_ip_count], rec->data->string, 4);
                                     used_zone_a_ip_count++;
                                 }
@@ -4662,8 +4678,8 @@ int main(int argc, char **argv) {
                 }
             } while (mhash_nextkey(bighash, key) == JS_SUCCESS);
         }
-
-        js_destroy(key); // Clean up the temporary key
+        // Clean up the temporary key
+        js_destroy(key); 
     }
 
     /* Limit the amount of memory we can use */
