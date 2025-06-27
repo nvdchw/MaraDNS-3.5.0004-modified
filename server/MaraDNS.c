@@ -65,7 +65,17 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <process.h>
 #define PIPE_NAME "\\\\.\\pipe\\maradns_synth"
+#define BUF_SIZE 512
+
+HANDLE hPipe = NULL;
+HANDLE hPipeThread = NULL;
+unsigned __stdcall pipe_server_thread(void *arg);
+void start_pipe_server();
+void stop_pipe_server();
+void send_all_synth_mappings(HANDLE hPipe);
+#endif
 
 
 /* Virutal memory limit */
@@ -485,55 +495,137 @@ int get_header_rd(js_string *query) {
         return *(query->string + 2) & 0x01;
 }
 
-// Converts a DNS wire-format name in js_string to a C string (hostname)
-// Assumes js->string points to the start of the QNAME (not the DNS header)
-int js_ntoa(js_string *js, char *out, size_t outlen) {
-    if (!js || !out || js->unit_count < 2) return -1;
-    size_t pos = 0, outpos = 0;
+#ifdef _WIN32
+unsigned __stdcall pipe_server_thread(void *arg) {
+    char buffer[BUF_SIZE];
+    DWORD bytesRead, bytesWritten;
 
-    while (pos < js->unit_count) {
-        unsigned char len = js->string[pos];
-        // If the length byte is 0, this indicates the end of the name
-        if (len == 0) {
-            if (outpos < outlen) out[outpos] = '\0';
-            else if (outlen > 0) out[outlen-1] = '\0';
-            return 0;
+    while (1) {
+        hPipe = CreateNamedPipeA(
+            PIPE_NAME,
+            PIPE_ACCESS_DUPLEX,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1, BUF_SIZE, BUF_SIZE, 0, NULL);
+
+        if (hPipe == INVALID_HANDLE_VALUE) {
+            printf("Failed to create named pipe. Error: %lu\n", GetLastError());
+            Sleep(1000);
+            continue;
         }
-        // If the length byte is invalid, break and return an error
-        if (len > 63 || pos + len + 1 > js->unit_count) break;
-        if (outpos && outpos < outlen-1) out[outpos++] = '.';
-        // Copy the label to the output string
-        for (int i = 0; i < len && outpos < outlen-1; i++)
-            out[outpos++] = js->string[pos + 1 + i];
-        pos += len + 1;
+
+        printf("[Pipe] Waiting for client to connect to %s...\n", PIPE_NAME);
+        BOOL connected = ConnectNamedPipe(hPipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+        if (!connected) {
+            CloseHandle(hPipe);
+            continue;
+        }
+
+        printf("[Pipe] Client connected. Waiting for command...\n");
+        if (ReadFile(hPipe, buffer, BUF_SIZE - 1, &bytesRead, NULL) && bytesRead > 0) {
+            buffer[bytesRead] = '\0';
+            printf("[Pipe] Received command: %s", buffer);
+
+            if (strcmp(buffer, "getAllSyntheticMappings\n") == 0) {
+                send_all_synth_mappings(hPipe);
+            } else {
+                const char *msg = "Unknown command\n";
+                WriteFile(hPipe, msg, (DWORD)strlen(msg), &bytesWritten, NULL);
+            }
+        }
+        FlushFileBuffers(hPipe);
+        DisconnectNamedPipe(hPipe);
+        CloseHandle(hPipe);
     }
-    // If we reached here, it means the name was malformed or too long
-    if (outlen > 0) out[outlen-1] = '\0';
-    return -1;
+    return 0;
 }
 
-/* This function writes a hostname/IP pair to a named pipe for
- * synthetic IPs.  This is used to communicate with the MaraDNS
- * synthetic IP server on Windows.
- * Input: hostname (the hostname), ip (the 4-byte IP address)
- * Output: None
- */
-// Writes a hostname/IP pair to the named pipe
-void write_to_named_pipe(const char *hostname, unsigned char ip[4]) {
-    // Open the named pipe for writing
-    HANDLE hPipe = CreateFileA(
-        PIPE_NAME, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
-    if (hPipe == INVALID_HANDLE_VALUE) return;
+void start_pipe_server() {
+    unsigned threadID;
+    hPipeThread = (HANDLE)_beginthreadex(NULL, 0, pipe_server_thread, NULL, 0, &threadID);
+}
 
-    // Write the hostname and IP to the pipe
-    char buffer[512];
-    int len = snprintf(buffer, sizeof(buffer), "%s, %d.%d.%d.%d\n",
-        hostname, ip[0], ip[1], ip[2], ip[3]);
-    DWORD written = 0;
-    WriteFile(hPipe, buffer, len, &written, NULL);
-    CloseHandle(hPipe);
+void stop_pipe_server() {
+    if (hPipeThread) {
+        TerminateThread(hPipeThread, 0);
+        CloseHandle(hPipeThread);
+        hPipeThread = NULL;
+    }
+}
+
+// Helper to send all synthetic mappings
+void send_all_synth_mappings(HANDLE hPipe) {
+    DWORD bytesWritten;
+    char line[256];
+    if (!synthetic_ip_hash) return;
+
+    js_string *key = js_create(256, 1);
+    if (!key) return;
+
+    if (mhash_firstkey(synthetic_ip_hash, key) == JS_SUCCESS) {
+        do {
+            mhash_e spot_data = mhash_get(synthetic_ip_hash, key);
+            if (spot_data.value && spot_data.datatype == 1) {
+                char hostname[256];
+                js_ntoa(key, hostname, sizeof(hostname));
+                unsigned char *ip = (unsigned char *)spot_data.value;
+                snprintf(line, sizeof(line), "%s %d.%d.%d.%d\n", hostname, ip[0], ip[1], ip[2], ip[3]);
+                WriteFile(hPipe, line, (DWORD)strlen(line), &bytesWritten, NULL);
+            }
+        } while (mhash_nextkey(synthetic_ip_hash, key) == JS_SUCCESS);
+    }
+    js_destroy(key);
 }
 #endif
+
+// Converts a DNS wire-format name in js_string to a C string (hostname)
+// Assumes js->string points to the start of the QNAME (not the DNS header)
+// int js_ntoa(js_string *js, char *out, size_t outlen) {
+//     if (!js || !out || js->unit_count < 2) return -1;
+//     size_t pos = 0, outpos = 0;
+
+//     while (pos < js->unit_count) {
+//         unsigned char len = js->string[pos];
+//         // If the length byte is 0, this indicates the end of the name
+//         if (len == 0) {
+//             if (outpos < outlen) out[outpos] = '\0';
+//             else if (outlen > 0) out[outlen-1] = '\0';
+//             return 0;
+//         }
+//         // If the length byte is invalid, break and return an error
+//         if (len > 63 || pos + len + 1 > js->unit_count) break;
+//         if (outpos && outpos < outlen-1) out[outpos++] = '.';
+//         // Copy the label to the output string
+//         for (int i = 0; i < len && outpos < outlen-1; i++)
+//             out[outpos++] = js->string[pos + 1 + i];
+//         pos += len + 1;
+//     }
+//     // If we reached here, it means the name was malformed or too long
+//     if (outlen > 0) out[outlen-1] = '\0';
+//     return -1;
+// }
+
+// /* This function writes a hostname/IP pair to a named pipe for
+//  * synthetic IPs.  This is used to communicate with the MaraDNS
+//  * synthetic IP server on Windows.
+//  * Input: hostname (the hostname), ip (the 4-byte IP address)
+//  * Output: None
+//  */
+// // Writes a hostname/IP pair to the named pipe
+// void write_to_named_pipe(const char *hostname, unsigned char ip[4]) {
+//     // Open the named pipe for writing
+//     HANDLE hPipe = CreateFileA(
+//         PIPE_NAME, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+//     if (hPipe == INVALID_HANDLE_VALUE) return;
+
+//     // Write the hostname and IP to the pipe
+//     char buffer[512];
+//     int len = snprintf(buffer, sizeof(buffer), "%s, %d.%d.%d.%d\n",
+//         hostname, ip[0], ip[1], ip[2], ip[3]);
+//     DWORD written = 0;
+//     WriteFile(hPipe, buffer, len, &written, NULL);
+//     CloseHandle(hPipe);
+// }
+// #endif
 
 /* This function checks if a given IP address is already in use in any
  * A record in the bighash.  It returns 1 if the IP is in use, and 0
@@ -588,13 +680,13 @@ int send_synthetic_a_reply(int id, int sock, conn *ect, js_string *query) {
         unsigned char *stored_ip = malloc(4);
         memcpy(stored_ip, ip, 4);
         mhash_put(synthetic_ip_hash, key, stored_ip, 1);
-#ifdef _WIN32
-        // Output to named pipe
-        char hostname[256];
-        // Convert js_string to C string
-        js_ntoa(query, hostname, sizeof(hostname));
-        write_to_named_pipe(hostname, ip);
-#endif
+// #ifdef _WIN32
+//         // Output to named pipe
+//         char hostname[256];
+//         // Convert js_string to C string
+//         js_ntoa(query, hostname, sizeof(hostname));
+//         write_to_named_pipe(hostname, ip);
+// #endif
     }
 
     printf("[DEBUG] send_synthetic_a_reply: Responding with IP: %d.%d.%d.%d\n",
@@ -3942,6 +4034,11 @@ int main(int argc, char **argv) {
     WSAStartup( wVersionRequested, &wsaData);
 #endif /* MINGW32 */
 
+// Start named pipe server
+#ifdef _WIN32
+    start_pipe_server();
+#endif
+
 #ifndef AUTHONLY
     int recurse_min_bind_port = 15000;
     int recurse_number_ports = 4096;
@@ -4796,6 +4893,9 @@ int main(int argc, char **argv) {
         if(got_hup_signal != 0) {
             printf("HUP signal sent to MaraDNS process\n");
             printf("Exiting with return value of 8\n");
+#ifdef _WIN32
+            stop_pipe_server();
+#endif
             exit(8);
             }
         /* Update the timestamp; this needs to be run once a second */
@@ -4903,6 +5003,11 @@ int main(int argc, char **argv) {
         }
 
     /* We should never end up here */
+
+#ifdef _WIN32
+    stop_pipe_server();
+#endif
+
 
     exit(7); /* Exit code 7: Broke out of loop somehow */
 
