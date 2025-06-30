@@ -190,7 +190,7 @@ ipv4pair long_packet[512];
  * etc.). */
 ipv4pair admin_acl[512];
 
-// A list of IPv4 addresses that are allowed
+unsigned char synthetic_ip_subnet[4] = {10, 0, 0, 0}; // Default value
 unsigned int synthetic_ip_counter = 1; // Start at 1, wrap at 254
 mhash *synthetic_ip_hash = 0; // hostname -> assigned synthetic IP
 
@@ -496,6 +496,10 @@ int get_header_rd(js_string *query) {
 }
 
 #ifdef _WIN32
+/* This function runs in a separate thread to handle named pipe connections
+ * for synthetic IP mappings. It listens for commands from a client and responds
+ * with the current synthetic IP mappings.
+ */
 unsigned __stdcall pipe_server_thread(void *arg) {
     char buffer[BUF_SIZE];
     DWORD bytesRead, bytesWritten;
@@ -505,7 +509,8 @@ unsigned __stdcall pipe_server_thread(void *arg) {
             PIPE_NAME,
             PIPE_ACCESS_DUPLEX,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-            1, BUF_SIZE, BUF_SIZE, 0, NULL);
+            PIPE_UNLIMITED_INSTANCES,
+            BUF_SIZE, BUF_SIZE, 0, NULL);
 
         if (hPipe == INVALID_HANDLE_VALUE) {
             printf("Failed to create named pipe. Error: %lu\n", GetLastError());
@@ -539,11 +544,13 @@ unsigned __stdcall pipe_server_thread(void *arg) {
     return 0;
 }
 
+// Starts the named pipe server thread to handle synthetic IP mappings
 void start_pipe_server() {
     unsigned threadID;
     hPipeThread = (HANDLE)_beginthreadex(NULL, 0, pipe_server_thread, NULL, 0, &threadID);
 }
 
+// Stops the named pipe server thread
 void stop_pipe_server() {
     if (hPipeThread) {
         TerminateThread(hPipeThread, 0);
@@ -552,18 +559,47 @@ void stop_pipe_server() {
     }
 }
 
+// Converts a DNS wire-format name in js_string to a C string (hostname)
+// Assumes js->string points to the start of the QNAME (not the DNS header)
+int js_ntoa(js_string *js, char *out, size_t outlen) {
+    if (!js || !out || js->unit_count < 2) return -1;
+    size_t pos = 0, outpos = 0;
+
+    while (pos < js->unit_count) {
+        unsigned char len = js->string[pos];
+        // If the length byte is 0, this indicates the end of the name
+        if (len == 0) {
+            if (outpos < outlen) out[outpos] = '\0';
+            else if (outlen > 0) out[outlen-1] = '\0';
+            return 0;
+        }
+        // If the length byte is invalid, break and return an error
+        if (len > 63 || pos + len + 1 > js->unit_count) break;
+        if (outpos && outpos < outlen-1) out[outpos++] = '.';
+        // Copy the label to the output string
+        for (int i = 0; i < len && outpos < outlen-1; i++)
+            out[outpos++] = js->string[pos + 1 + i];
+        pos += len + 1;
+    }
+    // If we reached here, it means the name was malformed or too long
+    if (outlen > 0) out[outlen-1] = '\0';
+    return -1;
+}
+
 // Helper to send all synthetic mappings
 void send_all_synth_mappings(HANDLE hPipe) {
     DWORD bytesWritten;
-    char line[256];
+    char line[512]; // Increased from 256 to 512
     if (!synthetic_ip_hash) return;
 
     js_string *key = js_create(256, 1);
     if (!key) return;
 
+    // Iterate through all keys in the synthetic IP hash
     if (mhash_firstkey(synthetic_ip_hash, key) == JS_SUCCESS) {
         do {
             mhash_e spot_data = mhash_get(synthetic_ip_hash, key);
+            // If we have a valid mapping, format it and write to the pipe
             if (spot_data.value && spot_data.datatype == 1) {
                 char hostname[256];
                 js_ntoa(key, hostname, sizeof(hostname));
@@ -576,33 +612,6 @@ void send_all_synth_mappings(HANDLE hPipe) {
     js_destroy(key);
 }
 #endif
-
-// Converts a DNS wire-format name in js_string to a C string (hostname)
-// Assumes js->string points to the start of the QNAME (not the DNS header)
-// int js_ntoa(js_string *js, char *out, size_t outlen) {
-//     if (!js || !out || js->unit_count < 2) return -1;
-//     size_t pos = 0, outpos = 0;
-
-//     while (pos < js->unit_count) {
-//         unsigned char len = js->string[pos];
-//         // If the length byte is 0, this indicates the end of the name
-//         if (len == 0) {
-//             if (outpos < outlen) out[outpos] = '\0';
-//             else if (outlen > 0) out[outlen-1] = '\0';
-//             return 0;
-//         }
-//         // If the length byte is invalid, break and return an error
-//         if (len > 63 || pos + len + 1 > js->unit_count) break;
-//         if (outpos && outpos < outlen-1) out[outpos++] = '.';
-//         // Copy the label to the output string
-//         for (int i = 0; i < len && outpos < outlen-1; i++)
-//             out[outpos++] = js->string[pos + 1 + i];
-//         pos += len + 1;
-//     }
-//     // If we reached here, it means the name was malformed or too long
-//     if (outlen > 0) out[outlen-1] = '\0';
-//     return -1;
-// }
 
 // /* This function writes a hostname/IP pair to a named pipe for
 //  * synthetic IPs.  This is used to communicate with the MaraDNS
@@ -633,7 +642,6 @@ void send_all_synth_mappings(HANDLE hPipe) {
  * Input: An unsigned char array of length 4 containing the IP address
  * Output: 1 if the IP is in use, 0 otherwise
  */
-// Returns 1 if ip[4] is already used in any A record, 0 otherwise
 int is_ip_in_zone(unsigned char ip[4]) {
         // Check the used_zone_a_ips array
         for (int i = 0; i < used_zone_a_ip_count; i++) {
@@ -657,8 +665,10 @@ int send_synthetic_a_reply(int id, int sock, conn *ect, js_string *query) {
     int i;
     mhash_e spot_data;
     js_string *key = js_create(256,1);
-    // Assign private IP address in 192.168.21.0/24 subnet
-    unsigned char ip[4] = {192, 168, 21, 0};
+
+    // Use configurable subnet
+    unsigned char ip[4];
+    memcpy(ip, synthetic_ip_subnet, 4);
 
     // Use the query as the key (lowercase for consistency)
     js_copy(query, key);
@@ -4779,6 +4789,18 @@ int main(int argc, char **argv) {
         js_destroy(key); 
     }
 
+    // Add the bind addresses to used_zone_a_ips (so that own IP never gets assigned as synthetic IP)
+    for (int i = 0; bind_addresses[i].ip != 0xffffffff && used_zone_a_ip_count < MAX_USED_IPS; i++) {
+        unsigned char ip[4];
+        uint32_t addr = bind_addresses[i].ip; // <-- FIX: remove ntohl()
+        ip[0] = (addr >> 24) & 0xFF;
+        ip[1] = (addr >> 16) & 0xFF;
+        ip[2] = (addr >> 8) & 0xFF;
+        ip[3] = addr & 0xFF;
+        memcpy(used_zone_a_ips[used_zone_a_ip_count], ip, 4);
+        used_zone_a_ip_count++;
+    }
+
     /* Limit the amount of memory we can use */
 #ifdef MAX_MEM
     /* Limit the maximum amount of memory we can allocate, in
@@ -4849,6 +4871,23 @@ int main(int argc, char **argv) {
             printf("Csv2 default zonefile parsed\n");
             default_zonefile_enabled = 1;
             default_dos_level = 0;
+    }
+
+    // Read synthetic_ip_subnet from mararc
+    verbstr = read_string_kvar("synthetic_ip_subnet");
+    if (verbstr != 0 && js_length(verbstr) > 0) {
+        char subnet_str[32];
+        if (js_js2str(verbstr, subnet_str, sizeof(subnet_str)) == JS_SUCCESS) {
+            int b0, b1, b2, b3;
+            if (sscanf(subnet_str, "%d.%d.%d.%d", &b0, &b1, &b2, &b3) == 4) {
+                synthetic_ip_subnet[0] = (unsigned char)b0;
+                synthetic_ip_subnet[1] = (unsigned char)b1;
+                synthetic_ip_subnet[2] = (unsigned char)b2;
+                synthetic_ip_subnet[3] = (unsigned char)b3;
+            }
+        }
+        js_destroy(verbstr);
+        verbstr = 0;
     }
 
     /* Set the dos_protection_level to see if we disable some features

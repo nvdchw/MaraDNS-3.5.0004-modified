@@ -31,7 +31,7 @@
 
 /* Keywords that are non-dictionary strings in Mara's rc file */
 
-#define KEYCOUNT 55
+#define KEYCOUNT 56
 
 char *keywords[KEYCOUNT] = {
         "bind_address", /* IPv4 Addresses to bind to (old name) */
@@ -143,7 +143,9 @@ char *keywords[KEYCOUNT] = {
         "notthere_ip", /* The IP to give users when they try to recursively
                         * query a host that is not there or isn't responding
                         */
-        "zone_transfer_acl" /* ACL of IPs allowed to perform zone transfers */
+        "zone_transfer_acl", /* ACL of IPs allowed to perform zone transfers */
+        "synthetic_ip_subnet" /* The IP subnet that MaraDNS will synthesize
+                               * addresses for.*/
         };
 
 /* mara_goodjs: Determine if a given js_string object is a valid string

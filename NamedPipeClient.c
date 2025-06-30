@@ -33,7 +33,7 @@ int main() {
         return 1;
     }
 
-    // Read response from the server
+    // Read and print response from the server
     printf("Sent command. Waiting for response...\n");
     while (ReadFile(hPipe, buffer, BUF_SIZE - 1, &bytesRead, NULL) && bytesRead > 0) {
         buffer[bytesRead] = '\0';
