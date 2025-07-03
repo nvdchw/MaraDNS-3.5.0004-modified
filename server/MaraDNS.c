@@ -72,11 +72,22 @@
 HANDLE hPipe = NULL;
 HANDLE hPipeThread = NULL;
 
-// Buffer for new mapping notification
-// (Can be changed to a proper queue and mutex for production)
-char new_mapping_buf[512];
-volatile int new_mapping_ready = 0;
-CRITICAL_SECTION mapping_cs;
+#define PIPE_QUEUE_SIZE 128
+
+typedef struct {
+    char hostname[256];
+    unsigned char ip[4];
+} mapping_notification_t;
+
+typedef struct {
+    mapping_notification_t queue[PIPE_QUEUE_SIZE];
+    int head;
+    int tail;
+    int count;
+    CRITICAL_SECTION cs;
+} mapping_queue_t;
+
+mapping_queue_t mapping_queue;
 
 unsigned __stdcall pipe_server_thread(void *arg);
 void start_pipe_server();
@@ -198,8 +209,16 @@ ipv4pair long_packet[512];
  * etc.). */
 ipv4pair admin_acl[512];
 
-unsigned char synthetic_ip_subnet[4] = {10, 0, 0, 0}; // Default value
-unsigned int synthetic_ip_counter = 1; // Start at 1, wrap at 254
+typedef struct {
+    unsigned char base[4];
+    unsigned char mask_bits; // e.g., 24 for /24
+} synth_subnet_t;
+
+#define MAX_SYNTH_SUBNETS 8
+synth_subnet_t synthetic_ip_subnets[MAX_SYNTH_SUBNETS];
+unsigned int synthetic_ip_subnet_count = 0;
+unsigned int synthetic_ip_subnet_index = 0;
+unsigned int synthetic_ip_counter = 1;
 mhash *synthetic_ip_hash = 0; // hostname -> assigned synthetic IP
 
 /* A list of IPs used in the zone file; this is used to prevent MaraDNS
@@ -550,12 +569,17 @@ unsigned __stdcall pipe_server_thread(void *arg) {
             }
 
             // Check if a new mapping is ready to send
-            EnterCriticalSection(&mapping_cs);
-            if (new_mapping_ready) {
-                WriteFile(hPipe, new_mapping_buf, (DWORD)strlen(new_mapping_buf), &bytesWritten, NULL);
-                new_mapping_ready = 0;
+            EnterCriticalSection(&mapping_queue.cs);
+            while (mapping_queue.count > 0) {
+                mapping_notification_t *n = &mapping_queue.queue[mapping_queue.head];
+                char msg[512];
+                DWORD bytesWritten;
+                snprintf(msg, sizeof(msg), "%s %d.%d.%d.%d\n", n->hostname, n->ip[0], n->ip[1], n->ip[2], n->ip[3]);
+                WriteFile(hPipe, msg, (DWORD)strlen(msg), &bytesWritten, NULL);
+                mapping_queue.head = (mapping_queue.head + 1) % PIPE_QUEUE_SIZE;
+                mapping_queue.count--;
             }
-            LeaveCriticalSection(&mapping_cs);
+            LeaveCriticalSection(&mapping_queue.cs);
 
             Sleep(50); // Avoid busy loop
         }
@@ -664,10 +688,20 @@ void send_all_synth_mappings(HANDLE hPipe) {
  * Output: None
  */
 void notify_new_mapping(const char *hostname, unsigned char ip[4]) {
-    EnterCriticalSection(&mapping_cs);
-    snprintf(new_mapping_buf, sizeof(new_mapping_buf), "%s %d.%d.%d.%d\n", hostname, ip[0], ip[1], ip[2], ip[3]);
-    new_mapping_ready = 1;
-    LeaveCriticalSection(&mapping_cs);
+    EnterCriticalSection(&mapping_queue.cs);
+    // Check if the queue is full
+    if (mapping_queue.count < PIPE_QUEUE_SIZE) {
+        mapping_notification_t *n = &mapping_queue.queue[mapping_queue.tail];
+        strncpy(n->hostname, hostname, sizeof(n->hostname) - 1);
+        n->hostname[sizeof(n->hostname) - 1] = '\0';
+        memcpy(n->ip, ip, 4);
+        mapping_queue.tail = (mapping_queue.tail + 1) % PIPE_QUEUE_SIZE;
+        mapping_queue.count++;
+    } else {
+        fprintf(stderr, "[PIPE] Notification queue full, dropping mapping for %s %d.%d.%d.%d\n",
+            hostname, ip[0], ip[1], ip[2], ip[3]);
+    }
+    LeaveCriticalSection(&mapping_queue.cs);
 }
 #endif
 /* This function checks if a given IP address is already in use in any
@@ -702,7 +736,7 @@ int send_synthetic_a_reply(int id, int sock, conn *ect, js_string *query) {
 
     // Use configurable subnet
     unsigned char ip[4];
-    memcpy(ip, synthetic_ip_subnet, 4);
+    unsigned int attempts = 0;
 
     // Use the query as the key (lowercase for consistency)
     js_copy(query, key);
@@ -715,15 +749,56 @@ int send_synthetic_a_reply(int id, int sock, conn *ect, js_string *query) {
         memcpy(ip, spot_data.value, 4);
     } else {
         // Assign a new IP, skipping any that are already in the zone
-        do {
-            ip[3] = synthetic_ip_counter++;
-            // Wrap around if we exceed 254
-            if (synthetic_ip_counter > 254) synthetic_ip_counter = 1;
-        } while (is_ip_in_zone(ip));
+        while (1) {
+            synth_subnet_t *subnet = &synthetic_ip_subnets[synthetic_ip_subnet_index];
+            unsigned int host_max = (1U << (32 - subnet->mask_bits)) - 2; // -2: skip .0 and .255 for /24
+            if (host_max < 1) host_max = 1; // For /31 or /32, minimum 1 host
+
+            // Convert base to uint32
+            uint32_t base_ip = (subnet->base[0] << 24) | (subnet->base[1] << 16) | (subnet->base[2] << 8) | subnet->base[3];
+            unsigned int host_part = synthetic_ip_counter++;
+
+            // Add host_part to base_ip
+            uint32_t ip_int = (base_ip & (~((1U << (32 - subnet->mask_bits)) - 1))) | (host_part & ((1U << (32 - subnet->mask_bits)) - 1));
+
+            // Split back to octets
+            ip[0] = (ip_int >> 24) & 0xFF;
+            ip[1] = (ip_int >> 16) & 0xFF;
+            ip[2] = (ip_int >> 8) & 0xFF;
+            ip[3] = ip_int & 0xFF;
+
+            // Check if the IP counter exceeds the maximum hosts in the subnet
+            if (synthetic_ip_counter > host_max) {
+                synthetic_ip_counter = 1;
+                synthetic_ip_subnet_index++;
+                // Wrap around if we exceed the number of synthetic subnets
+                if (synthetic_ip_subnet_index >= synthetic_ip_subnet_count)
+                    synthetic_ip_subnet_index = 0;
+            }
+            attempts++;
+            // Check if we have exhausted all subnets
+            if (attempts > synthetic_ip_subnet_count * host_max) {
+                fprintf(stderr, "All synthetic IP subnets exhausted, cannot assign more synthetic IPs.\n");
+                js_destroy(key);
+                return JS_ERROR;
+            }
+            if (!is_ip_in_zone(ip)) break;
+        }
+
         // Store the IP in the synthetic IP hash table
         unsigned char *stored_ip = malloc(4);
+        if (!stored_ip) {
+            fprintf(stderr, "Out of memory allocating synthetic IP.\n");
+            js_destroy(key);
+            return JS_ERROR;
+        }
         memcpy(stored_ip, ip, 4);
-        mhash_put(synthetic_ip_hash, key, stored_ip, 1);
+        if (mhash_put(synthetic_ip_hash, key, stored_ip, 1) != JS_SUCCESS) {
+            fprintf(stderr, "Failed to store synthetic IP mapping.\n");
+            free(stored_ip);
+            js_destroy(key);
+            return JS_ERROR;
+        }
 #ifdef _WIN32
         // Output to named pipe
         char hostname[256];
@@ -4080,7 +4155,8 @@ int main(int argc, char **argv) {
 // Start named pipe server
 #ifdef _WIN32
     /* Initialize the named pipe server */
-    InitializeCriticalSection(&mapping_cs);
+    InitializeCriticalSection(&mapping_queue.cs);
+    mapping_queue.head = mapping_queue.tail = mapping_queue.count = 0;
     start_pipe_server();
 #endif
 
@@ -4911,14 +4987,35 @@ int main(int argc, char **argv) {
     // Read synthetic_ip_subnet from mararc
     verbstr = read_string_kvar("synthetic_ip_subnet");
     if (verbstr != 0 && js_length(verbstr) > 0) {
-        char subnet_str[32];
+        char subnet_str[256];
+        // Split the subnet string (by comma) into individual subnets
         if (js_js2str(verbstr, subnet_str, sizeof(subnet_str)) == JS_SUCCESS) {
-            int b0, b1, b2, b3;
-            if (sscanf(subnet_str, "%d.%d.%d.%d", &b0, &b1, &b2, &b3) == 4) {
-                synthetic_ip_subnet[0] = (unsigned char)b0;
-                synthetic_ip_subnet[1] = (unsigned char)b1;
-                synthetic_ip_subnet[2] = (unsigned char)b2;
-                synthetic_ip_subnet[3] = (unsigned char)b3;
+            char *token = strtok(subnet_str, ",");
+            synthetic_ip_subnet_count = 0;
+            // Parse each subnet in the format "a.b.c.d/mask" or "a.b.c.d"
+            while (token && synthetic_ip_subnet_count < MAX_SYNTH_SUBNETS) {
+                int b0, b1, b2, b3, mask = 24;
+                if (sscanf(token, "%d.%d.%d.%d/%d", &b0, &b1, &b2, &b3, &mask) >= 4) {
+                    if (b0 < 0 || b0 > 255 || b1 < 0 || b1 > 255 || b2 < 0 || b2 > 255 || b3 < 0 || b3 > 255) {
+                        fprintf(stderr, "Invalid IP in synthetic_ip_subnet: '%s'\n", token);
+                        continue;
+                    }
+                    // Default mask to 24 if not specified
+                    if (mask < 1 || mask > 30) {
+                        fprintf(stderr, "Invalid mask %d in '%s', defaulting to /24\n", mask, token);
+                        mask = 24;
+                    }
+                    // Store the subnet in the synthetic_ip_subnets array
+                    synthetic_ip_subnets[synthetic_ip_subnet_count].base[0] = (unsigned char)b0;
+                    synthetic_ip_subnets[synthetic_ip_subnet_count].base[1] = (unsigned char)b1;
+                    synthetic_ip_subnets[synthetic_ip_subnet_count].base[2] = (unsigned char)b2;
+                    synthetic_ip_subnets[synthetic_ip_subnet_count].base[3] = (unsigned char)b3;
+                    synthetic_ip_subnets[synthetic_ip_subnet_count].mask_bits = (unsigned char)mask;
+                    synthetic_ip_subnet_count++;
+                } else {
+                    fprintf(stderr, "Malformed subnet entry: '%s'\n", token);
+                }
+                token = strtok(NULL, ",");
             }
         }
         js_destroy(verbstr);
@@ -5082,7 +5179,7 @@ int main(int argc, char **argv) {
     // Stop the pipe server if we are running on Windows
     stop_pipe_server();
     // Delete the critical section used for mapping
-    DeleteCriticalSection(&mapping_cs);
+    DeleteCriticalSection(&mapping_queue.cs);
 #endif
 
 
