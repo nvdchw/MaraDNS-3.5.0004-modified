@@ -71,10 +71,18 @@
 
 HANDLE hPipe = NULL;
 HANDLE hPipeThread = NULL;
+
+// Buffer for new mapping notification
+// (Can be changed to a proper queue and mutex for production)
+char new_mapping_buf[512];
+volatile int new_mapping_ready = 0;
+CRITICAL_SECTION mapping_cs;
+
 unsigned __stdcall pipe_server_thread(void *arg);
 void start_pipe_server();
 void stop_pipe_server();
 void send_all_synth_mappings(HANDLE hPipe);
+void notify_new_mapping(const char *hostname, unsigned char ip[4]);
 #endif
 
 
@@ -496,10 +504,7 @@ int get_header_rd(js_string *query) {
 }
 
 #ifdef _WIN32
-/* This function runs in a separate thread to handle named pipe connections
- * for synthetic IP mappings. It listens for commands from a client and responds
- * with the current synthetic IP mappings.
- */
+// Named pipe server thread to handle synthetic IP mappings
 unsigned __stdcall pipe_server_thread(void *arg) {
     char buffer[BUF_SIZE];
     DWORD bytesRead, bytesWritten;
@@ -525,17 +530,34 @@ unsigned __stdcall pipe_server_thread(void *arg) {
             continue;
         }
 
-        printf("[Pipe] Client connected. Waiting for command...\n");
-        if (ReadFile(hPipe, buffer, BUF_SIZE - 1, &bytesRead, NULL) && bytesRead > 0) {
-            buffer[bytesRead] = '\0';
-            printf("[Pipe] Received command: %s", buffer);
-
-            if (strcmp(buffer, "getAllSyntheticMappings\n") == 0) {
-                send_all_synth_mappings(hPipe);
-            } else {
-                const char *msg = "Unknown command\n";
-                WriteFile(hPipe, msg, (DWORD)strlen(msg), &bytesWritten, NULL);
+        printf("[Pipe] Client connected. Entering session loop...\n");
+        while (1) {
+            // Wait for either a command or a new mapping to send
+            // Use PeekNamedPipe to check for client input without blocking
+            DWORD avail = 0;
+            if (PeekNamedPipe(hPipe, NULL, 0, NULL, &avail, NULL) && avail > 0) {
+                if (ReadFile(hPipe, buffer, BUF_SIZE - 1, &bytesRead, NULL) && bytesRead > 0) {
+                    buffer[bytesRead] = '\0';
+                    if (strcmp(buffer, "getAllSyntheticMappings\n") == 0) {
+                        send_all_synth_mappings(hPipe);
+                    } else {
+                        const char *msg = "Unknown command\n";
+                        WriteFile(hPipe, msg, (DWORD)strlen(msg), &bytesWritten, NULL);
+                    }
+                } else {
+                    break; // Client disconnected
+                }
             }
+
+            // Check if a new mapping is ready to send
+            EnterCriticalSection(&mapping_cs);
+            if (new_mapping_ready) {
+                WriteFile(hPipe, new_mapping_buf, (DWORD)strlen(new_mapping_buf), &bytesWritten, NULL);
+                new_mapping_ready = 0;
+            }
+            LeaveCriticalSection(&mapping_cs);
+
+            Sleep(50); // Avoid busy loop
         }
         FlushFileBuffers(hPipe);
         DisconnectNamedPipe(hPipe);
@@ -611,7 +633,6 @@ void send_all_synth_mappings(HANDLE hPipe) {
     }
     js_destroy(key);
 }
-#endif
 
 // /* This function writes a hostname/IP pair to a named pipe for
 //  * synthetic IPs.  This is used to communicate with the MaraDNS
@@ -636,6 +657,19 @@ void send_all_synth_mappings(HANDLE hPipe) {
 // }
 // #endif
 
+/* This function notifies the named pipe server of a new mapping.
+ * It formats the hostname and IP address into a string and sets
+ * the new_mapping_ready flag to indicate that a new mapping is available.
+ * Input: hostname (the hostname), ip (the 4-byte IP address)
+ * Output: None
+ */
+void notify_new_mapping(const char *hostname, unsigned char ip[4]) {
+    EnterCriticalSection(&mapping_cs);
+    snprintf(new_mapping_buf, sizeof(new_mapping_buf), "%s %d.%d.%d.%d\n", hostname, ip[0], ip[1], ip[2], ip[3]);
+    new_mapping_ready = 1;
+    LeaveCriticalSection(&mapping_cs);
+}
+#endif
 /* This function checks if a given IP address is already in use in any
  * A record in the bighash.  It returns 1 if the IP is in use, and 0
  * otherwise.
@@ -690,13 +724,13 @@ int send_synthetic_a_reply(int id, int sock, conn *ect, js_string *query) {
         unsigned char *stored_ip = malloc(4);
         memcpy(stored_ip, ip, 4);
         mhash_put(synthetic_ip_hash, key, stored_ip, 1);
-// #ifdef _WIN32
-//         // Output to named pipe
-//         char hostname[256];
-//         // Convert js_string to C string
-//         js_ntoa(query, hostname, sizeof(hostname));
-//         write_to_named_pipe(hostname, ip);
-// #endif
+#ifdef _WIN32
+        // Output to named pipe
+        char hostname[256];
+        // Convert js_string to C string
+        js_ntoa(query, hostname, sizeof(hostname));
+        notify_new_mapping(hostname, ip);
+#endif
     }
 
     printf("[DEBUG] send_synthetic_a_reply: Responding with IP: %d.%d.%d.%d\n",
@@ -779,7 +813,6 @@ int mara_send(conn *ect, int sock, js_string *reply) {
                 return JS_ERROR;
         }
 }
-
 /* Return a packet indicating that there was an error in the received
    packet
    input: socket number,
@@ -4046,6 +4079,8 @@ int main(int argc, char **argv) {
 
 // Start named pipe server
 #ifdef _WIN32
+    /* Initialize the named pipe server */
+    InitializeCriticalSection(&mapping_cs);
     start_pipe_server();
 #endif
 
@@ -5044,7 +5079,10 @@ int main(int argc, char **argv) {
     /* We should never end up here */
 
 #ifdef _WIN32
+    // Stop the pipe server if we are running on Windows
     stop_pipe_server();
+    // Delete the critical section used for mapping
+    DeleteCriticalSection(&mapping_cs);
 #endif
 
 
