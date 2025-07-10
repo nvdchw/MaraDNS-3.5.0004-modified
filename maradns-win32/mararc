@@ -1,3 +1,7 @@
 ipv4_bind_addresses = "127.0.0.1"
 timestamp_type = 2
 random_seed_file = "secret.txt"
+csv2 = {}
+csv2["test.local."] = "db.test.local.txt"
+hide_disclaimer = "YES"
+synthetic_ip_subnet = "10.0.0.0/23,172.16.0.0/24"

@@ -74,11 +74,13 @@ HANDLE hPipeThread = NULL;
 
 #define PIPE_QUEUE_SIZE 128
 
+// Structure to hold a mapping notification
 typedef struct {
     char hostname[256];
     unsigned char ip[4];
 } mapping_notification_t;
 
+// Structure to hold the named pipe server's queue
 typedef struct {
     mapping_notification_t queue[PIPE_QUEUE_SIZE];
     int head;
@@ -87,13 +89,14 @@ typedef struct {
     CRITICAL_SECTION cs;
 } mapping_queue_t;
 
+// Global queue for mapping notifications
 mapping_queue_t mapping_queue;
 
 unsigned __stdcall pipe_server_thread(void *arg);
 void start_pipe_server();
 void stop_pipe_server();
 void send_all_synth_mappings(HANDLE hPipe);
-void notify_new_mapping(const char *hostname, unsigned char ip[4]);
+void add_new_mapping(const char *hostname, unsigned char ip[4]);
 #endif
 
 
@@ -219,14 +222,13 @@ synth_subnet_t synthetic_ip_subnets[MAX_SYNTH_SUBNETS];
 unsigned int synthetic_ip_subnet_count = 0;
 unsigned int synthetic_ip_subnet_index = 0;
 unsigned int synthetic_ip_counter = 1;
-mhash *synthetic_ip_hash = 0; // hostname -> assigned synthetic IP
+mhash *synthetic_ip_hash = 0;
 
 /* A list of IPs used in the zone file; this is used to prevent MaraDNS
  * from assigning the same synthetic IP to two different hostnames */
 #define MAX_USED_IPS 4096
 unsigned char used_zone_a_ips[MAX_USED_IPS][4];
 int used_zone_a_ip_count = 0;
-
 
 /* Some global variables so that the user can change the SOA origin (MINFO)
  * and the format of the SOA serial number if needed */
@@ -523,13 +525,60 @@ int get_header_rd(js_string *query) {
 }
 
 #ifdef _WIN32
-// Named pipe server thread to handle synthetic IP mappings
-unsigned __stdcall pipe_server_thread(void *arg) {
+/* Named pipe client handler thread to process commands from the client
+   This thread will handle commands sent by the client and send synthetic mappings
+   It will also send any new mappings in the queue to the client
+   The thread will run until the client disconnects or an error occurs */
+unsigned __stdcall pipe_client_thread(void *arg) {
+    HANDLE hPipe = (HANDLE)arg;
     char buffer[BUF_SIZE];
     DWORD bytesRead, bytesWritten;
+    printf("[Pipe] Client handler thread started.\n");
 
     while (1) {
-        hPipe = CreateNamedPipeA(
+        DWORD avail = 0;
+        // Check if there is data available to read from the pipe
+        if (PeekNamedPipe(hPipe, NULL, 0, NULL, &avail, NULL) && avail > 0) {
+            if (ReadFile(hPipe, buffer, BUF_SIZE - 1, &bytesRead, NULL) && bytesRead > 0) {
+                buffer[bytesRead] = '\0';
+                // Process the command received from the client
+                if (strcmp(buffer, "getAllSyntheticMappings\n") == 0) {
+                    send_all_synth_mappings(hPipe);
+                } else {
+                    // Handle other commands or unknown commands
+                    const char *msg = "Unknown command\n";
+                    WriteFile(hPipe, msg, (DWORD)strlen(msg), &bytesWritten, NULL);
+                }
+            } else {
+                break; // Client disconnected
+            }
+        }
+
+        // Read new mappings in the queue
+        EnterCriticalSection(&mapping_queue.cs);
+        while (mapping_queue.count > 0) {
+            // Dequeue a mapping notification
+            mapping_notification_t *n = &mapping_queue.queue[mapping_queue.head];
+            char msg[512];
+            snprintf(msg, sizeof(msg), "%s %d.%d.%d.%d\n", n->hostname, n->ip[0], n->ip[1], n->ip[2], n->ip[3]);
+            WriteFile(hPipe, msg, (DWORD)strlen(msg), &bytesWritten, NULL);
+            mapping_queue.head = (mapping_queue.head + 1) % PIPE_QUEUE_SIZE;
+            mapping_queue.count--;
+        }
+        LeaveCriticalSection(&mapping_queue.cs);
+        Sleep(50);
+    }
+    // Clean up the pipe handle
+    FlushFileBuffers(hPipe);
+    DisconnectNamedPipe(hPipe);
+    CloseHandle(hPipe);
+    printf("[Pipe] Client handler thread exiting.\n");
+    return 0;
+}
+// Named pipe server thread to handle synthetic IP mappings
+unsigned __stdcall pipe_server_thread(void *arg) {
+     while (1) {
+        HANDLE hPipe = CreateNamedPipeA(
             PIPE_NAME,
             PIPE_ACCESS_DUPLEX,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
@@ -543,57 +592,26 @@ unsigned __stdcall pipe_server_thread(void *arg) {
         }
 
         printf("[Pipe] Waiting for client to connect to %s...\n", PIPE_NAME);
+        // ConnectNamedPipe will block until a client connects
         BOOL connected = ConnectNamedPipe(hPipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
         if (!connected) {
             CloseHandle(hPipe);
             continue;
         }
 
-        printf("[Pipe] Client connected. Entering session loop...\n");
-        while (1) {
-            // Wait for either a command or a new mapping to send
-            // Use PeekNamedPipe to check for client input without blocking
-            DWORD avail = 0;
-            if (PeekNamedPipe(hPipe, NULL, 0, NULL, &avail, NULL) && avail > 0) {
-                if (ReadFile(hPipe, buffer, BUF_SIZE - 1, &bytesRead, NULL) && bytesRead > 0) {
-                    buffer[bytesRead] = '\0';
-                    if (strcmp(buffer, "getAllSyntheticMappings\n") == 0) {
-                        send_all_synth_mappings(hPipe);
-                    } else {
-                        const char *msg = "Unknown command\n";
-                        WriteFile(hPipe, msg, (DWORD)strlen(msg), &bytesWritten, NULL);
-                    }
-                } else {
-                    break; // Client disconnected
-                }
-            }
-
-            // Check if a new mapping is ready to send
-            EnterCriticalSection(&mapping_queue.cs);
-            while (mapping_queue.count > 0) {
-                mapping_notification_t *n = &mapping_queue.queue[mapping_queue.head];
-                char msg[512];
-                DWORD bytesWritten;
-                snprintf(msg, sizeof(msg), "%s %d.%d.%d.%d\n", n->hostname, n->ip[0], n->ip[1], n->ip[2], n->ip[3]);
-                WriteFile(hPipe, msg, (DWORD)strlen(msg), &bytesWritten, NULL);
-                mapping_queue.head = (mapping_queue.head + 1) % PIPE_QUEUE_SIZE;
-                mapping_queue.count--;
-            }
-            LeaveCriticalSection(&mapping_queue.cs);
-
-            Sleep(50); // Avoid busy loop
-        }
-        FlushFileBuffers(hPipe);
-        DisconnectNamedPipe(hPipe);
-        CloseHandle(hPipe);
+        printf("[Pipe] Client connected. Spawning handler thread...\n");
+        // Start a new thread for this client
+        _beginthreadex(NULL, 0, pipe_client_thread, hPipe, 0, NULL);
+        // Loop to accept more clients
     }
     return 0;
 }
 
-// Starts the named pipe server thread to handle synthetic IP mappings
+// Starts the named pipe server thread
 void start_pipe_server() {
     unsigned threadID;
-    hPipeThread = (HANDLE)_beginthreadex(NULL, 0, pipe_server_thread, NULL, 0, &threadID);
+    hPipeThread = (HANDLE)_beginthreadex(
+    NULL, 0, pipe_server_thread, NULL, 0, &threadID);
 }
 
 // Stops the named pipe server thread
@@ -635,9 +653,10 @@ int js_ntoa(js_string *js, char *out, size_t outlen) {
 // Helper to send all synthetic mappings
 void send_all_synth_mappings(HANDLE hPipe) {
     DWORD bytesWritten;
-    char line[512]; // Increased from 256 to 512
+    char line[512];
     if (!synthetic_ip_hash) return;
 
+    // Create a js_string to hold the key for iteration
     js_string *key = js_create(256, 1);
     if (!key) return;
 
@@ -655,31 +674,9 @@ void send_all_synth_mappings(HANDLE hPipe) {
             }
         } while (mhash_nextkey(synthetic_ip_hash, key) == JS_SUCCESS);
     }
+    // Clean up the js_string used for keys
     js_destroy(key);
 }
-
-// /* This function writes a hostname/IP pair to a named pipe for
-//  * synthetic IPs.  This is used to communicate with the MaraDNS
-//  * synthetic IP server on Windows.
-//  * Input: hostname (the hostname), ip (the 4-byte IP address)
-//  * Output: None
-//  */
-// // Writes a hostname/IP pair to the named pipe
-// void write_to_named_pipe(const char *hostname, unsigned char ip[4]) {
-//     // Open the named pipe for writing
-//     HANDLE hPipe = CreateFileA(
-//         PIPE_NAME, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
-//     if (hPipe == INVALID_HANDLE_VALUE) return;
-
-//     // Write the hostname and IP to the pipe
-//     char buffer[512];
-//     int len = snprintf(buffer, sizeof(buffer), "%s, %d.%d.%d.%d\n",
-//         hostname, ip[0], ip[1], ip[2], ip[3]);
-//     DWORD written = 0;
-//     WriteFile(hPipe, buffer, len, &written, NULL);
-//     CloseHandle(hPipe);
-// }
-// #endif
 
 /* This function notifies the named pipe server of a new mapping.
  * It formats the hostname and IP address into a string and sets
@@ -687,10 +684,11 @@ void send_all_synth_mappings(HANDLE hPipe) {
  * Input: hostname (the hostname), ip (the 4-byte IP address)
  * Output: None
  */
-void notify_new_mapping(const char *hostname, unsigned char ip[4]) {
+void add_new_mapping(const char *hostname, unsigned char ip[4]) {
     EnterCriticalSection(&mapping_queue.cs);
-    // Check if the queue is full
+    // Check that queue is not full before adding a new mapping
     if (mapping_queue.count < PIPE_QUEUE_SIZE) {
+        // Add the new mapping to the tail of the queue
         mapping_notification_t *n = &mapping_queue.queue[mapping_queue.tail];
         strncpy(n->hostname, hostname, sizeof(n->hostname) - 1);
         n->hostname[sizeof(n->hostname) - 1] = '\0';
@@ -698,12 +696,14 @@ void notify_new_mapping(const char *hostname, unsigned char ip[4]) {
         mapping_queue.tail = (mapping_queue.tail + 1) % PIPE_QUEUE_SIZE;
         mapping_queue.count++;
     } else {
+        // If the queue is full, log a message and drop the mapping
         fprintf(stderr, "[PIPE] Notification queue full, dropping mapping for %s %d.%d.%d.%d\n",
             hostname, ip[0], ip[1], ip[2], ip[3]);
     }
     LeaveCriticalSection(&mapping_queue.cs);
 }
 #endif
+
 /* This function checks if a given IP address is already in use in any
  * A record in the bighash.  It returns 1 if the IP is in use, and 0
  * otherwise.
@@ -748,18 +748,22 @@ int send_synthetic_a_reply(int id, int sock, conn *ect, js_string *query) {
         // Use the stored IP
         memcpy(ip, spot_data.value, 4);
     } else {
-        // Assign a new IP, skipping any that are already in the zone
+        // Assign a new IP, skipping any that are already specified in zone files
         while (1) {
             synth_subnet_t *subnet = &synthetic_ip_subnets[synthetic_ip_subnet_index];
             unsigned int host_max = (1U << (32 - subnet->mask_bits)) - 2; // -2: skip .0 and .255 for /24
             if (host_max < 1) host_max = 1; // For /31 or /32, minimum 1 host
 
-            // Convert base to uint32
-            uint32_t base_ip = (subnet->base[0] << 24) | (subnet->base[1] << 16) | (subnet->base[2] << 8) | subnet->base[3];
+            // Convert base IP to uint32
+            uint32_t base_ip = (subnet->base[0] << 24) |
+                            (subnet->base[1] << 16) |
+                            (subnet->base[2] << 8)  |
+                            subnet->base[3];
+            // Generate a synthetic host part
             unsigned int host_part = synthetic_ip_counter++;
-
             // Add host_part to base_ip
-            uint32_t ip_int = (base_ip & (~((1U << (32 - subnet->mask_bits)) - 1))) | (host_part & ((1U << (32 - subnet->mask_bits)) - 1));
+            uint32_t ip_int = (base_ip & (~((1U << (32 - subnet->mask_bits)) - 1))) |
+                            (host_part & ((1U << (32 - subnet->mask_bits)) - 1));
 
             // Split back to octets
             ip[0] = (ip_int >> 24) & 0xFF;
@@ -782,6 +786,7 @@ int send_synthetic_a_reply(int id, int sock, conn *ect, js_string *query) {
                 js_destroy(key);
                 return JS_ERROR;
             }
+            // Check if the generated IP is already specified in the zone files
             if (!is_ip_in_zone(ip)) break;
         }
 
@@ -800,20 +805,16 @@ int send_synthetic_a_reply(int id, int sock, conn *ect, js_string *query) {
             return JS_ERROR;
         }
 #ifdef _WIN32
-        // Output to named pipe
         char hostname[256];
         // Convert js_string to C string
         js_ntoa(query, hostname, sizeof(hostname));
-        notify_new_mapping(hostname, ip);
+        // Add the new mapping to the queue to output to named pipe
+        add_new_mapping(hostname, ip);
 #endif
     }
 
-    printf("[DEBUG] send_synthetic_a_reply: Responding with IP: %d.%d.%d.%d\n",
-        ip[0], ip[1], ip[2], ip[3]);
-    fflush(stdout);
-
-    if ((reply = js_create(512,1)) == 0) {
-        printf("[DEBUG] send_synthetic_a_reply: Failed to create reply js_string\n");
+    // Create a reply js_string
+    if((reply = js_create(512,1)) == 0) {
         js_destroy(key);
         return JS_ERROR;
     }
@@ -850,14 +851,14 @@ int send_synthetic_a_reply(int id, int sock, conn *ect, js_string *query) {
     for (i = 0; i < 4; i++)
         if (js_addbyte(reply, ip[i]) == JS_ERROR) goto cleanup;
 
-    printf("[DEBUG] send_synthetic_a_reply: Sending reply...\n");
+    // Send the synthetic reply
     mara_send(ect, sock, reply);
     js_destroy(reply);
     js_destroy(key);
     return JS_SUCCESS;
 
 cleanup:
-    printf("[DEBUG] send_synthetic_a_reply: cleanup called due to error\n");
+    // Cleanup in case of error
     js_destroy(reply);
     js_destroy(key);
     return JS_ERROR;
@@ -868,25 +869,26 @@ cleanup:
  * connection), a socket number, and a js_string to send, and sends
  * a message over the 'net */
 int mara_send(conn *ect, int sock, js_string *reply) {
-        if(ect == 0 || reply == 0) {
-                return JS_ERROR;
-        }
-        if(ect->type == 4) {
-                sendto(sock,(const char *)reply->string,reply->unit_count,0,
-                                (struct sockaddr *)ect->d,ect->addrlen);
-                return JS_SUCCESS;
+    // Check if ect is valid
+    if(ect == 0 || reply == 0) {
+            return JS_ERROR;
+    }
+    if(ect->type == 4) {
+        sendto(sock,(const char *)reply->string,reply->unit_count,0,
+                        (struct sockaddr *)ect->d,ect->addrlen);
+        return JS_SUCCESS;
 #ifdef IPV6
 /* Cygwin doesn't have ipv6 yet */
 #ifndef __CYGWIN__
-        } else if(ect->type == 6) {
-                sendto(sock,(const char *)reply->string,reply->unit_count,0,
-                                (struct sockaddr *)ect->d,ect->addrlen);
-                return JS_SUCCESS;
+    } else if(ect->type == 6) {
+            sendto(sock,(const char *)reply->string,reply->unit_count,0,
+                            (struct sockaddr *)ect->d,ect->addrlen);
+            return JS_SUCCESS;
 #endif /* __CYGWIN__ */
 #endif
-        } else {
-                return JS_ERROR;
-        }
+    } else {
+            return JS_ERROR;
+    }
 }
 /* Return a packet indicating that there was an error in the received
    packet
@@ -2981,10 +2983,8 @@ int proc_query(js_string *raw, conn *ect, int sock) {
     // Intercept A queries and reply with synthetic IP
     if(qtype == RR_A) {
         mhash_e spot_data = mhash_get(bighash, lookfor);
-        // If we have a record with this name, we will not send a synthetic reply
+        // Do not send a synthetic reply if we have a record of this name
         if(spot_data.value == 0) {
-            printf("[DEBUG] proc_query: Intercepted A query, sending synthetic reply\n");
-            fflush(stdout);
             // Create a synthetic reply
             send_synthetic_a_reply(header.id, sock, ect, origq);
             // Clean up and return success
@@ -4860,7 +4860,6 @@ int main(int argc, char **argv) {
     if(dns_records_served > 0) {
         printf("MaraDNS proudly serves you %d DNS records\n",
                dns_records_served);
-        // Scan bighash for A records and collect their IPs
         used_zone_a_ip_count = 0;
         // Create a temporary key for iteration
         js_string *key = js_create(256, 1);
@@ -4903,7 +4902,7 @@ int main(int argc, char **argv) {
     // Add the bind addresses to used_zone_a_ips (so that own IP never gets assigned as synthetic IP)
     for (int i = 0; bind_addresses[i].ip != 0xffffffff && used_zone_a_ip_count < MAX_USED_IPS; i++) {
         unsigned char ip[4];
-        uint32_t addr = bind_addresses[i].ip; // <-- FIX: remove ntohl()
+        uint32_t addr = bind_addresses[i].ip;
         ip[0] = (addr >> 24) & 0xFF;
         ip[1] = (addr >> 16) & 0xFF;
         ip[2] = (addr >> 8) & 0xFF;
@@ -4988,8 +4987,9 @@ int main(int argc, char **argv) {
     verbstr = read_string_kvar("synthetic_ip_subnet");
     if (verbstr != 0 && js_length(verbstr) > 0) {
         char subnet_str[256];
-        // Split the subnet string (by comma) into individual subnets
+        // Convert variable data to a C string
         if (js_js2str(verbstr, subnet_str, sizeof(subnet_str)) == JS_SUCCESS) {
+            // Split the subnet string (by comma) into individual subnets
             char *token = strtok(subnet_str, ",");
             synthetic_ip_subnet_count = 0;
             // Parse each subnet in the format "a.b.c.d/mask" or "a.b.c.d"
