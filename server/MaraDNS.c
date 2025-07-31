@@ -4152,11 +4152,11 @@ int main(int argc, char **argv) {
     WSAStartup( wVersionRequested, &wsaData);
 #endif /* MINGW32 */
 
-// Start named pipe server
 #ifdef _WIN32
-    /* Initialize the named pipe server */
+    // Initialise the critical section for the mapping queue
     InitializeCriticalSection(&mapping_queue.cs);
     mapping_queue.head = mapping_queue.tail = mapping_queue.count = 0;
+    // Start the named pipe server
     start_pipe_server();
 #endif
 
