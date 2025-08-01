@@ -63,6 +63,43 @@
 #include "timestamp.h"
 #include "read_kvars.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#include <process.h>
+#define PIPE_NAME "\\\\.\\pipe\\maradns_synth"
+#define BUF_SIZE 512
+
+HANDLE hPipe = NULL;
+HANDLE hPipeThread = NULL;
+
+#define PIPE_QUEUE_SIZE 128
+
+// Structure to hold a mapping notification
+typedef struct {
+    char hostname[256];
+    unsigned char ip[4];
+} mapping_notification_t;
+
+// Structure to hold the named pipe server's queue
+typedef struct {
+    mapping_notification_t queue[PIPE_QUEUE_SIZE];
+    int head;
+    int tail;
+    int count;
+    CRITICAL_SECTION cs;
+} mapping_queue_t;
+
+// Global queue for mapping notifications
+mapping_queue_t mapping_queue;
+
+unsigned __stdcall pipe_server_thread(void *arg);
+void start_pipe_server();
+void stop_pipe_server();
+void send_all_synth_mappings(HANDLE hPipe);
+void add_new_mapping(const char *hostname, unsigned char ip[4]);
+#endif
+
+
 /* Virutal memory limit */
 #ifdef RLIMIT_AS
 #define MAX_MEM RLIMIT_AS
@@ -174,6 +211,24 @@ ipv4pair long_packet[512];
  * number, see how many threads are running, the number of processes running,
  * etc.). */
 ipv4pair admin_acl[512];
+
+typedef struct {
+    unsigned char base[4];
+    unsigned char mask_bits; // e.g., 24 for /24
+} synth_subnet_t;
+
+#define MAX_SYNTH_SUBNETS 8
+synth_subnet_t synthetic_ip_subnets[MAX_SYNTH_SUBNETS];
+unsigned int synthetic_ip_subnet_count = 0;
+unsigned int synthetic_ip_subnet_index = 0;
+unsigned int synthetic_ip_counter = 1;
+mhash *synthetic_ip_hash = 0;
+
+/* A list of IPs used in the zone file; this is used to prevent MaraDNS
+ * from assigning the same synthetic IP to two different hostnames */
+#define MAX_USED_IPS 4096
+unsigned char used_zone_a_ips[MAX_USED_IPS][4];
+int used_zone_a_ip_count = 0;
 
 /* Some global variables so that the user can change the SOA origin (MINFO)
  * and the format of the SOA serial number if needed */
@@ -469,32 +524,372 @@ int get_header_rd(js_string *query) {
         return *(query->string + 2) & 0x01;
 }
 
+#ifdef _WIN32
+/* Named pipe client handler thread to process commands from the client
+   This thread will handle commands sent by the client and send synthetic mappings
+   It will also send any new mappings in the queue to the client
+   The thread will run until the client disconnects or an error occurs */
+unsigned __stdcall pipe_client_thread(void *arg) {
+    HANDLE hPipe = (HANDLE)arg;
+    char buffer[BUF_SIZE];
+    DWORD bytesRead, bytesWritten;
+    printf("[Pipe] Client handler thread started.\n");
+
+    while (1) {
+        DWORD avail = 0;
+        // Check if there is data available to read from the pipe
+        if (PeekNamedPipe(hPipe, NULL, 0, NULL, &avail, NULL) && avail > 0) {
+            if (ReadFile(hPipe, buffer, BUF_SIZE - 1, &bytesRead, NULL) && bytesRead > 0) {
+                buffer[bytesRead] = '\0';
+                // Process the command received from the client
+                if (strcmp(buffer, "getAllSyntheticMappings\n") == 0) {
+                    send_all_synth_mappings(hPipe);
+                } else {
+                    // Handle other commands or unknown commands
+                    const char *msg = "Unknown command\n";
+                    WriteFile(hPipe, msg, (DWORD)strlen(msg), &bytesWritten, NULL);
+                }
+            } else {
+                break; // Client disconnected
+            }
+        }
+
+        // Read new mappings in the queue
+        EnterCriticalSection(&mapping_queue.cs);
+        while (mapping_queue.count > 0) {
+            // Dequeue a mapping notification
+            mapping_notification_t *n = &mapping_queue.queue[mapping_queue.head];
+            char msg[512];
+            snprintf(msg, sizeof(msg), "%s %d.%d.%d.%d\n", n->hostname, n->ip[0], n->ip[1], n->ip[2], n->ip[3]);
+            WriteFile(hPipe, msg, (DWORD)strlen(msg), &bytesWritten, NULL);
+            mapping_queue.head = (mapping_queue.head + 1) % PIPE_QUEUE_SIZE;
+            mapping_queue.count--;
+        }
+        LeaveCriticalSection(&mapping_queue.cs);
+        Sleep(50);
+    }
+    // Clean up the pipe handle
+    FlushFileBuffers(hPipe);
+    DisconnectNamedPipe(hPipe);
+    CloseHandle(hPipe);
+    printf("[Pipe] Client handler thread exiting.\n");
+    return 0;
+}
+// Named pipe server thread to handle synthetic IP mappings
+unsigned __stdcall pipe_server_thread(void *arg) {
+     while (1) {
+        HANDLE hPipe = CreateNamedPipeA(
+            PIPE_NAME,
+            PIPE_ACCESS_DUPLEX,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            PIPE_UNLIMITED_INSTANCES,
+            BUF_SIZE, BUF_SIZE, 0, NULL);
+
+        if (hPipe == INVALID_HANDLE_VALUE) {
+            printf("Failed to create named pipe. Error: %lu\n", GetLastError());
+            Sleep(1000);
+            continue;
+        }
+
+        printf("[Pipe] Waiting for client to connect to %s...\n", PIPE_NAME);
+        // ConnectNamedPipe will block until a client connects
+        BOOL connected = ConnectNamedPipe(hPipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+        if (!connected) {
+            CloseHandle(hPipe);
+            continue;
+        }
+
+        printf("[Pipe] Client connected. Spawning handler thread...\n");
+        // Start a new thread for this client
+        _beginthreadex(NULL, 0, pipe_client_thread, hPipe, 0, NULL);
+        // Loop to accept more clients
+    }
+    return 0;
+}
+
+// Starts the named pipe server thread
+void start_pipe_server() {
+    unsigned threadID;
+    hPipeThread = (HANDLE)_beginthreadex(
+    NULL, 0, pipe_server_thread, NULL, 0, &threadID);
+}
+
+// Stops the named pipe server thread
+void stop_pipe_server() {
+    if (hPipeThread) {
+        TerminateThread(hPipeThread, 0);
+        CloseHandle(hPipeThread);
+        hPipeThread = NULL;
+    }
+}
+
+// Converts a DNS wire-format name in js_string to a C string (hostname)
+// Assumes js->string points to the start of the QNAME (not the DNS header)
+int js_ntoa(js_string *js, char *out, size_t outlen) {
+    if (!js || !out || js->unit_count < 2) return -1;
+    size_t pos = 0, outpos = 0;
+
+    while (pos < js->unit_count) {
+        unsigned char len = js->string[pos];
+        // If the length byte is 0, this indicates the end of the name
+        if (len == 0) {
+            if (outpos < outlen) out[outpos] = '\0';
+            else if (outlen > 0) out[outlen-1] = '\0';
+            return 0;
+        }
+        // If the length byte is invalid, break and return an error
+        if (len > 63 || pos + len + 1 > js->unit_count) break;
+        if (outpos && outpos < outlen-1) out[outpos++] = '.';
+        // Copy the label to the output string
+        for (int i = 0; i < len && outpos < outlen-1; i++)
+            out[outpos++] = js->string[pos + 1 + i];
+        pos += len + 1;
+    }
+    // If we reached here, it means the name was malformed or too long
+    if (outlen > 0) out[outlen-1] = '\0';
+    return -1;
+}
+
+// Helper to send all synthetic mappings
+void send_all_synth_mappings(HANDLE hPipe) {
+    DWORD bytesWritten;
+    char line[512];
+    if (!synthetic_ip_hash) return;
+
+    // Create a js_string to hold the key for iteration
+    js_string *key = js_create(256, 1);
+    if (!key) return;
+
+    // Iterate through all keys in the synthetic IP hash
+    if (mhash_firstkey(synthetic_ip_hash, key) == JS_SUCCESS) {
+        do {
+            mhash_e spot_data = mhash_get(synthetic_ip_hash, key);
+            // If we have a valid mapping, format it and write to the pipe
+            if (spot_data.value && spot_data.datatype == 1) {
+                char hostname[256];
+                js_ntoa(key, hostname, sizeof(hostname));
+                unsigned char *ip = (unsigned char *)spot_data.value;
+                snprintf(line, sizeof(line), "%s %d.%d.%d.%d\n", hostname, ip[0], ip[1], ip[2], ip[3]);
+                WriteFile(hPipe, line, (DWORD)strlen(line), &bytesWritten, NULL);
+            }
+        } while (mhash_nextkey(synthetic_ip_hash, key) == JS_SUCCESS);
+    }
+    // Clean up the js_string used for keys
+    js_destroy(key);
+}
+
+/* This function notifies the named pipe server of a new mapping.
+ * It formats the hostname and IP address into a string and sets
+ * the new_mapping_ready flag to indicate that a new mapping is available.
+ * Input: hostname (the hostname), ip (the 4-byte IP address)
+ * Output: None
+ */
+void add_new_mapping(const char *hostname, unsigned char ip[4]) {
+    EnterCriticalSection(&mapping_queue.cs);
+    // Check that queue is not full before adding a new mapping
+    if (mapping_queue.count < PIPE_QUEUE_SIZE) {
+        // Add the new mapping to the tail of the queue
+        mapping_notification_t *n = &mapping_queue.queue[mapping_queue.tail];
+        strncpy(n->hostname, hostname, sizeof(n->hostname) - 1);
+        n->hostname[sizeof(n->hostname) - 1] = '\0';
+        memcpy(n->ip, ip, 4);
+        mapping_queue.tail = (mapping_queue.tail + 1) % PIPE_QUEUE_SIZE;
+        mapping_queue.count++;
+    } else {
+        // If the queue is full, log a message and drop the mapping
+        fprintf(stderr, "[PIPE] Notification queue full, dropping mapping for %s %d.%d.%d.%d\n",
+            hostname, ip[0], ip[1], ip[2], ip[3]);
+    }
+    LeaveCriticalSection(&mapping_queue.cs);
+}
+#endif
+
+/* This function checks if a given IP address is already in use in any
+ * A record in the bighash.  It returns 1 if the IP is in use, and 0
+ * otherwise.
+ * Input: An unsigned char array of length 4 containing the IP address
+ * Output: 1 if the IP is in use, 0 otherwise
+ */
+int is_ip_in_zone(unsigned char ip[4]) {
+        // Check the used_zone_a_ips array
+        for (int i = 0; i < used_zone_a_ip_count; i++) {
+        if (memcmp(used_zone_a_ips[i], ip, 4) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* This function sends a synthetic A reply to a DNS query.
+ * It assigns a synthetic IP address to the hostname in the query,
+ * and sends back an A record with that IP.
+ * Input: id (DNS transaction ID), sock (socket number), ect (connection
+ *        structure), query (the DNS query string)
+ * Output: JS_SUCCESS on success, JS_ERROR on error
+ */
+int send_synthetic_a_reply(int id, int sock, conn *ect, js_string *query) {
+    js_string *reply;
+    q_header header;
+    int i;
+    mhash_e spot_data;
+    js_string *key = js_create(256,1);
+
+    // Use configurable subnet
+    unsigned char ip[4];
+    unsigned int attempts = 0;
+
+    // Use the query as the key (lowercase for consistency)
+    js_copy(query, key);
+    fold_case(key);
+
+    // Check if this hostname already has a synthetic IP
+    spot_data = mhash_get(synthetic_ip_hash, key);
+    if(spot_data.value != 0 && spot_data.datatype == 1) {
+        // Use the stored IP
+        memcpy(ip, spot_data.value, 4);
+    } else {
+        // Assign a new IP, skipping any that are already specified in zone files
+        while (1) {
+            synth_subnet_t *subnet = &synthetic_ip_subnets[synthetic_ip_subnet_index];
+            unsigned int host_max = (1U << (32 - subnet->mask_bits)) - 2; // -2: skip .0 and .255 for /24
+            if (host_max < 1) host_max = 1; // For /31 or /32, minimum 1 host
+
+            // Convert base IP to uint32
+            uint32_t base_ip = (subnet->base[0] << 24) |
+                            (subnet->base[1] << 16) |
+                            (subnet->base[2] << 8)  |
+                            subnet->base[3];
+            // Generate a synthetic host part
+            unsigned int host_part = synthetic_ip_counter++;
+            // Add host_part to base_ip
+            uint32_t ip_int = (base_ip & (~((1U << (32 - subnet->mask_bits)) - 1))) |
+                            (host_part & ((1U << (32 - subnet->mask_bits)) - 1));
+
+            // Split back to octets
+            ip[0] = (ip_int >> 24) & 0xFF;
+            ip[1] = (ip_int >> 16) & 0xFF;
+            ip[2] = (ip_int >> 8) & 0xFF;
+            ip[3] = ip_int & 0xFF;
+
+            // Check if the IP counter exceeds the maximum hosts in the subnet
+            if (synthetic_ip_counter > host_max) {
+                synthetic_ip_counter = 1;
+                synthetic_ip_subnet_index++;
+                // Wrap around if we exceed the number of synthetic subnets
+                if (synthetic_ip_subnet_index >= synthetic_ip_subnet_count)
+                    synthetic_ip_subnet_index = 0;
+            }
+            attempts++;
+            // Check if we have exhausted all subnets
+            if (attempts > synthetic_ip_subnet_count * host_max) {
+                fprintf(stderr, "All synthetic IP subnets exhausted, cannot assign more synthetic IPs.\n");
+                js_destroy(key);
+                return JS_ERROR;
+            }
+            // Check if the generated IP is already specified in the zone files
+            if (!is_ip_in_zone(ip)) break;
+        }
+
+        // Store the IP in the synthetic IP hash table
+        unsigned char *stored_ip = malloc(4);
+        if (!stored_ip) {
+            fprintf(stderr, "Out of memory allocating synthetic IP.\n");
+            js_destroy(key);
+            return JS_ERROR;
+        }
+        memcpy(stored_ip, ip, 4);
+        if (mhash_put(synthetic_ip_hash, key, stored_ip, 1) != JS_SUCCESS) {
+            fprintf(stderr, "Failed to store synthetic IP mapping.\n");
+            free(stored_ip);
+            js_destroy(key);
+            return JS_ERROR;
+        }
+#ifdef _WIN32
+        char hostname[256];
+        // Convert js_string to C string
+        js_ntoa(query, hostname, sizeof(hostname));
+        // Add the new mapping to the queue to output to named pipe
+        add_new_mapping(hostname, ip);
+#endif
+    }
+
+    // Create a reply js_string
+    if((reply = js_create(512,1)) == 0) {
+        js_destroy(key);
+        return JS_ERROR;
+    }
+
+    // Build DNS header
+    header.id = id;
+    header.qr = 1;
+    header.opcode = 0;
+    header.aa = 1;
+    header.tc = 0;
+    header.rd = 0;
+    header.ra = 0;
+    header.z = 0;
+    header.rcode = 0;
+    header.qdcount = 1;
+    header.ancount = 1;
+    header.nscount = 0;
+    header.arcount = 0;
+
+    // Set the header in the reply
+    if (make_hdr(&header, reply) == JS_ERROR) goto cleanup;
+
+    // Append the question section: QNAME + QTYPE + QCLASS
+    if (js_append(query, reply) == JS_ERROR) goto cleanup;
+    if (js_adduint16(reply, 1) == JS_ERROR) goto cleanup; // Class IN
+
+    // Answer section
+    // Name: pointer to offset 12 (start of QNAME in DNS packet)
+    if (js_adduint16(reply, 0xc00c) == JS_ERROR) goto cleanup;
+    if (js_adduint16(reply, 1) == JS_ERROR) goto cleanup; // Type A
+    if (js_adduint16(reply, 1) == JS_ERROR) goto cleanup; // Class IN
+    if (js_adduint32(reply, 60) == JS_ERROR) goto cleanup; // TTL 60s
+    if (js_adduint16(reply, 4) == JS_ERROR) goto cleanup; // RDLENGTH
+    for (i = 0; i < 4; i++)
+        if (js_addbyte(reply, ip[i]) == JS_ERROR) goto cleanup;
+
+    // Send the synthetic reply
+    mara_send(ect, sock, reply);
+    js_destroy(reply);
+    js_destroy(key);
+    return JS_SUCCESS;
+
+cleanup:
+    // Cleanup in case of error
+    js_destroy(reply);
+    js_destroy(key);
+    return JS_ERROR;
+}
+
 /* This function takes a conn *ect (a MaraDNS-specific description of a
  * connection that can be the IP and port of either a ipv4 or ipv6
  * connection), a socket number, and a js_string to send, and sends
  * a message over the 'net */
 int mara_send(conn *ect, int sock, js_string *reply) {
-        if(ect == 0 || reply == 0) {
-                return JS_ERROR;
-        }
-        if(ect->type == 4) {
-                sendto(sock,reply->string,reply->unit_count,0,
-                                (struct sockaddr *)ect->d,ect->addrlen);
-                return JS_SUCCESS;
+    // Check if ect is valid
+    if(ect == 0 || reply == 0) {
+            return JS_ERROR;
+    }
+    if(ect->type == 4) {
+        sendto(sock,(const char *)reply->string,reply->unit_count,0,
+                        (struct sockaddr *)ect->d,ect->addrlen);
+        return JS_SUCCESS;
 #ifdef IPV6
 /* Cygwin doesn't have ipv6 yet */
 #ifndef __CYGWIN__
-        } else if(ect->type == 6) {
-                sendto(sock,reply->string,reply->unit_count,0,
-                                (struct sockaddr *)ect->d,ect->addrlen);
-                return JS_SUCCESS;
+    } else if(ect->type == 6) {
+            sendto(sock,(const char *)reply->string,reply->unit_count,0,
+                            (struct sockaddr *)ect->d,ect->addrlen);
+            return JS_SUCCESS;
 #endif /* __CYGWIN__ */
 #endif
-        } else {
-                return JS_ERROR;
-        }
+    } else {
+            return JS_ERROR;
+    }
 }
-
 /* Return a packet indicating that there was an error in the received
    packet
    input: socket number,
@@ -590,7 +985,7 @@ int udperror(int sock,js_string *raw, struct sockaddr_in *from,
 
     /* Send them the reply */
     if(ect == 0) {
-        sendto(sock,reply->string,reply->unit_count,0,
+        sendto(sock,(const char *)reply->string,reply->unit_count,0,
             (struct sockaddr *)from,len_inet);
     } else {
         mara_send(ect,sock,reply);
@@ -1106,7 +1501,7 @@ long_packet_ok:
 
     /* Success! Put out the good data */
     if(ect == 0) {
-        sendto(sock,ar->string,ar->unit_count,0,
+        sendto(sock,(const char *)ar->string,ar->unit_count,0,
             (struct sockaddr *)client,len_inet);
     } else {
         mara_send(ect,sock,ar);
@@ -1578,7 +1973,7 @@ int udpstar(rr *where,int id,int sock,struct sockaddr_in *client,
 
     /* Success! Put out the good data */
     if(ect == 0) {
-        sendto(sock,ar->string,ar->unit_count,0,
+        sendto(sock,(const char *)ar->string,ar->unit_count,0,
             (struct sockaddr *)client,len_inet);
     } else {
         mara_send(ect,sock,ar);
@@ -1637,7 +2032,7 @@ int make_notthere_reply(int id, int sock, struct sockaddr_in *client,
 
         /* Send answer over UDP */
         if(ect == 0) {
-                sendto(sock,most->string,most->unit_count,0,
+                sendto(sock,(const char *)most->string,most->unit_count,0,
                         (struct sockaddr *)client,len_inet);
         } else {
                 mara_send(ect,sock,most);
@@ -1893,7 +2288,7 @@ int udpnotfound(rr *where, int id, int sock, struct sockaddr_in *client,
 
     /* Success! Put out the good data */
     if(ect == 0) {
-        sendto(sock,compressed->string,compressed->unit_count,0,
+        sendto(sock,(const char *)compressed->string,compressed->unit_count,0,
             (struct sockaddr *)client,len_inet);
     } else {
         mara_send(ect,sock,compressed);
@@ -2584,6 +2979,19 @@ int proc_query(js_string *raw, conn *ect, int sock) {
     if(qtype == JS_ERROR) {
         goto serv_fail;
         }
+
+    // Intercept A queries and reply with synthetic IP
+    if(qtype == RR_A) {
+        mhash_e spot_data = mhash_get(bighash, lookfor);
+        // Do not send a synthetic reply if we have a record of this name
+        if(spot_data.value == 0) {
+            // Create a synthetic reply
+            send_synthetic_a_reply(header.id, sock, ect, origq);
+            // Clean up and return success
+            js_destroy(lookfor); js_destroy(origq); js_destroy(lc);
+            return JS_SUCCESS;
+        }
+    }
 
     /* We may reject AAAA queries */
     if(qtype == 28 && reject_aaaa != 0) {
@@ -3567,7 +3975,7 @@ int getudp(int *sock,ipv4pair *addr,conn *ect,
 #ifdef SELECT_PROBLEM
             fcntl(sock[counter], F_SETFL, O_NONBLOCK);
 #endif
-            len = recvfrom(sock[counter],data->string,max_len,0,
+            len = recvfrom(sock[counter],(char *)data->string,max_len,0,
                            (struct sockaddr *)ipv4_client,
                            (socklen_t *)&(ect->addrlen));
             if(len < 0) {
@@ -3599,7 +4007,7 @@ int getudp(int *sock,ipv4pair *addr,conn *ect,
             fcntl(sock[counter], F_SETFL, O_NONBLOCK);
 #endif
             stupid_gcc_warning = ect->addrlen;
-            len = recvfrom(sock[counter],data->string,max_len,0,
+            len = recvfrom(sock[counter],(char *)data->string,max_len,0,
                            (struct sockaddr *)ipv6_client,
                            &stupid_gcc_warning);
             ect->addrlen = stupid_gcc_warning;
@@ -3706,7 +4114,7 @@ int main(int argc, char **argv) {
     int errorn, value, maxprocs, counter;
     int sock[514];
     int cache_size;
-    int min_ttl_n = 300, min_ttl_c = 300;
+    // int min_ttl_n = 300, min_ttl_c = 300;
     int timestamp_type = 5; /* Type of timestamp */
 #ifndef AUTHONLY
     int max_glueless; /* Maximum allowed glueless level */
@@ -3720,14 +4128,14 @@ int main(int argc, char **argv) {
     int thread_overhead = THREAD_OVERHEAD; /* The amount of memory we need
                                             * to allow to be allocated for
                                             * threads */
-#else
-    int thread_overhead = 0; /* No memory needed for threads */
+// #else
+//     int thread_overhead = 0; /* No memory needed for threads */
 /* Cygwin doesn't have ipv6 support yet */
-#ifndef __CYGWIN__
-    struct sockaddr_in6 *clin6;
-#endif /* __CYGWIN__ */
+// #ifndef __CYGWIN__
+//     struct sockaddr_in6 *clin6;
+// #endif /* __CYGWIN__ */
 #endif
-    int verbose_query = 0;
+    // int verbose_query = 0;
     struct sockaddr client;
     struct sockaddr_in *clin = 0; /* So we can log the IP */
 #ifndef MINGW32
@@ -3743,6 +4151,14 @@ int main(int argc, char **argv) {
     WORD wVersionRequested = MAKEWORD(2,2);
     WSAStartup( wVersionRequested, &wsaData);
 #endif /* MINGW32 */
+
+#ifdef _WIN32
+    // Initialise the critical section for the mapping queue
+    InitializeCriticalSection(&mapping_queue.cs);
+    mapping_queue.head = mapping_queue.tail = mapping_queue.count = 0;
+    // Start the named pipe server
+    start_pipe_server();
+#endif
 
 #ifndef AUTHONLY
     int recurse_min_bind_port = 15000;
@@ -3771,9 +4187,9 @@ int main(int argc, char **argv) {
     clin = (struct sockaddr_in *)&client;
 #ifdef AUTHONLY
 /* Cygwin doesn't have ipv6 yet */
-#ifndef __CYGWIN__
-    clin6 = (struct sockaddr_in6 *)&client;
-#endif /* __CYGWIN__ */
+// #ifndef __CYGWIN__
+//     clin6 = (struct sockaddr_in6 *)&client;
+// #endif /* __CYGWIN__ */
 #endif
 
     /* Initialize the strings (allocate memory for them, etc.) */
@@ -3933,8 +4349,8 @@ int main(int argc, char **argv) {
     set_timestamp(timestamp_type);
 
     /* Get the minttl values from the kvar database (if there) */
-    min_ttl_n = read_numeric_kvar("min_ttl",300);
-    min_ttl_c = read_numeric_kvar("min_ttl_cname",min_ttl_n);
+    // min_ttl_n = read_numeric_kvar("min_ttl",300);
+    // min_ttl_c = read_numeric_kvar("min_ttl_cname",min_ttl_n);
     min_visible_ttl = read_numeric_kvar("min_visible_ttl",30);
     if(min_visible_ttl < 5)
         min_visible_ttl = 5;
@@ -4003,7 +4419,7 @@ int main(int argc, char **argv) {
     /* Whether to supress dangling CNAME warnings */
     no_cname_warnings = read_numeric_kvar("no_cname_warnings",0);
 
-    verbose_query = read_numeric_kvar("verbose_query",0);
+    // verbose_query = read_numeric_kvar("verbose_query",0);
 
     /* Set the dns_port */
     dns_port = read_numeric_kvar("dns_port",53);
@@ -4433,13 +4849,67 @@ int main(int argc, char **argv) {
     if(bighash == 0)
         harderror(L_NOBIGHASH); /* "Could not create big hash" */
 
+    /* Create the synthetic IP hash table */
+    synthetic_ip_hash = mhash_create(8);
+    if(synthetic_ip_hash == 0)
+        harderror("Could not create synthetic_ip_hash");
+
     /* populate_main uses qual timestamps for the csv2 zone files */
     qual_set_time();
     value = populate_main(bighash,errors,recursion_enabled);
     if(dns_records_served > 0) {
         printf("MaraDNS proudly serves you %d DNS records\n",
                dns_records_served);
+        used_zone_a_ip_count = 0;
+        // Create a temporary key for iteration
+        js_string *key = js_create(256, 1);
+        if (key == NULL) {
+            fprintf(stderr, "Failed to create js_string for key iteration\n");
+            exit(1);
         }
+
+        if (mhash_firstkey(bighash, key) == JS_SUCCESS) {
+            // Iterate through the bighash to find A records
+            do {
+                // Get the data associated with the key
+                mhash_e spot_data = mhash_get(bighash, key);
+                if (spot_data.value != 0 && spot_data.datatype == MARA_DNS_LIST) {
+                    rr_list *answer = (rr_list *)spot_data.value;
+                    // If the data is a list, iterate through it
+                    while (answer) {
+                        rr *rec = answer->data;
+                        // Iterate through the records in the answer
+                        while (rec) {
+                            // If the record is an A record and has valid data
+                            if (rec->rr_type == RR_A && rec->data && rec->data->unit_count == 4) {
+                                if (used_zone_a_ip_count < MAX_USED_IPS) {
+                                    // Store the first 4 bytes of the A record's data into used_zone_a_ips
+                                    memcpy(used_zone_a_ips[used_zone_a_ip_count], rec->data->string, 4);
+                                    used_zone_a_ip_count++;
+                                }
+                            }
+                            rec = rec->next;
+                        }
+                        answer = answer->next;
+                    }
+                }
+            } while (mhash_nextkey(bighash, key) == JS_SUCCESS);
+        }
+        // Clean up the temporary key
+        js_destroy(key); 
+    }
+
+    // Add the bind addresses to used_zone_a_ips (so that own IP never gets assigned as synthetic IP)
+    for (int i = 0; bind_addresses[i].ip != 0xffffffff && used_zone_a_ip_count < MAX_USED_IPS; i++) {
+        unsigned char ip[4];
+        uint32_t addr = bind_addresses[i].ip;
+        ip[0] = (addr >> 24) & 0xFF;
+        ip[1] = (addr >> 16) & 0xFF;
+        ip[2] = (addr >> 8) & 0xFF;
+        ip[3] = addr & 0xFF;
+        memcpy(used_zone_a_ips[used_zone_a_ip_count], ip, 4);
+        used_zone_a_ip_count++;
+    }
 
     /* Limit the amount of memory we can use */
 #ifdef MAX_MEM
@@ -4513,6 +4983,45 @@ int main(int argc, char **argv) {
             default_dos_level = 0;
     }
 
+    // Read synthetic_ip_subnet from mararc
+    verbstr = read_string_kvar("synthetic_ip_subnet");
+    if (verbstr != 0 && js_length(verbstr) > 0) {
+        char subnet_str[256];
+        // Convert variable data to a C string
+        if (js_js2str(verbstr, subnet_str, sizeof(subnet_str)) == JS_SUCCESS) {
+            // Split the subnet string (by comma) into individual subnets
+            char *token = strtok(subnet_str, ",");
+            synthetic_ip_subnet_count = 0;
+            // Parse each subnet in the format "a.b.c.d/mask" or "a.b.c.d"
+            while (token && synthetic_ip_subnet_count < MAX_SYNTH_SUBNETS) {
+                int b0, b1, b2, b3, mask = 24;
+                if (sscanf(token, "%d.%d.%d.%d/%d", &b0, &b1, &b2, &b3, &mask) >= 4) {
+                    if (b0 < 0 || b0 > 255 || b1 < 0 || b1 > 255 || b2 < 0 || b2 > 255 || b3 < 0 || b3 > 255) {
+                        fprintf(stderr, "Invalid IP in synthetic_ip_subnet: '%s'\n", token);
+                        continue;
+                    }
+                    // Default mask to 24 if not specified
+                    if (mask < 1 || mask > 30) {
+                        fprintf(stderr, "Invalid mask %d in '%s', defaulting to /24\n", mask, token);
+                        mask = 24;
+                    }
+                    // Store the subnet in the synthetic_ip_subnets array
+                    synthetic_ip_subnets[synthetic_ip_subnet_count].base[0] = (unsigned char)b0;
+                    synthetic_ip_subnets[synthetic_ip_subnet_count].base[1] = (unsigned char)b1;
+                    synthetic_ip_subnets[synthetic_ip_subnet_count].base[2] = (unsigned char)b2;
+                    synthetic_ip_subnets[synthetic_ip_subnet_count].base[3] = (unsigned char)b3;
+                    synthetic_ip_subnets[synthetic_ip_subnet_count].mask_bits = (unsigned char)mask;
+                    synthetic_ip_subnet_count++;
+                } else {
+                    fprintf(stderr, "Malformed subnet entry: '%s'\n", token);
+                }
+                token = strtok(NULL, ",");
+            }
+        }
+        js_destroy(verbstr);
+        verbstr = 0;
+    }
+
     /* Set the dos_protection_level to see if we disable some features
      * to protect us from a denial of service attack. */
     dos_protection_level =
@@ -4555,6 +5064,9 @@ int main(int argc, char **argv) {
         if(got_hup_signal != 0) {
             printf("HUP signal sent to MaraDNS process\n");
             printf("Exiting with return value of 8\n");
+#ifdef _WIN32
+            stop_pipe_server();
+#endif
             exit(8);
             }
         /* Update the timestamp; this needs to be run once a second */
@@ -4662,6 +5174,14 @@ int main(int argc, char **argv) {
         }
 
     /* We should never end up here */
+
+#ifdef _WIN32
+    // Stop the pipe server if we are running on Windows
+    stop_pipe_server();
+    // Delete the critical section used for mapping
+    DeleteCriticalSection(&mapping_queue.cs);
+#endif
+
 
     exit(7); /* Exit code 7: Broke out of loop somehow */
 

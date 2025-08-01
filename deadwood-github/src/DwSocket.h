@@ -75,7 +75,10 @@
 #define NO_INET_PTON
 #define sa_family_t uint16_t
 #define socklen_t int32_t
+#ifndef EINPROGRESS
 #define EINPROGRESS WSAEWOULDBLOCK
+#endif
+
 /* This has a strange name because winsock.h defines SOCKET_ERROR */
 #define SCKT_ERR WSAGetLastError()
 /* This actually isn't supported in winsock but we do the ioctl thing
@@ -275,7 +278,7 @@ SOCKET bind_set_dns(ip_addr_T *ip, sockaddr_all_T *dns_do, int type);
 SOCKET do_bind(ip_addr_T *ip,int type);
 
 /* Get an upstream IP address (Not thread safe w/o locking) */
-ip_addr_T get_upstream_ip();
+ip_addr_T get_upstream_ip(dw_str *query, int b);
 
 /* Find a free remote pending connection */
 int_fast32_t find_free_remote();

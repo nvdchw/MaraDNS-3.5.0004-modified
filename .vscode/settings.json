@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "functions_dns.h": "c",
+        "string.h": "c",
+        "csv2_database.h": "c"
+    }
+}
